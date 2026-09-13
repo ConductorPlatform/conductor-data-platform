@@ -177,6 +177,7 @@ def _allowlisted_env(spec: RuntimeArtifactSpec) -> dict[str, str]:
         "CONDUCTOR_TEMPLATE_VERSION": spec.template_version,
         "PROJECT_SLUG": spec.project_slug,
         "AIRFLOW_EXTERNAL_HOST": airflow_host,
+        "AIRFLOW_INTERNAL_ALIAS": f"airflow-{spec.project_id}",
         "AIRFLOW_DB_NAME": spec.airflow_db_name,
         "AIRFLOW_DB_ROLE": spec.airflow_db_role,
         "AIRFLOW_DB_PASSWORD_URLENCODED": quote(spec.airflow_db_password, safe=""),

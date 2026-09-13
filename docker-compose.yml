@@ -143,6 +143,7 @@ services:
       frontend_backend:
         aliases:
           - fastapi-proxy-target
+      runtime_ingress: {}
     volumes:
       - ./backend/app:/app/app  # hot-reload
       - ./backend/tests:/app/tests  # test files
@@ -160,6 +161,28 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+  # The sole component that can create or inspect project Docker resources.
+  lifecycle-worker:
+    build: ./backend
+    image: conductor-backend:latest
+    env_file: ./backend/.env
+    command: python -m app.workers.lifecycle
+    environment:
+      CONDUCTOR_DATABASE_URL: >-
+        postgresql+asyncpg://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/${CONDUCTOR_DB_NAME:-conductor}
+      CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY: ${CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY:?Set CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY to a stable Fernet key}
+      CONDUCTOR_LIFECYCLE_RUNTIME_ROOT: /var/lib/conductor/runtimes
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./runtime:/var/lib/conductor/runtimes
+    networks:
+      default: {}
+      runtime_ingress: {}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
   # ─── Conductor Frontend (placeholder — TBD) ───
   # react-ui:
@@ -348,6 +371,8 @@ services:
   code-server:
     build: ./docker/code-server
     image: conductor-code-server:latest
+    profiles:
+      - mvp-04-ide
     environment:
       CODE_SERVER_AUTH: jwt
       CODE_SERVER_JWT_SECRET: ${CONDUCTOR_CODE_SERVER_JWT_SECRET:-conductor-cs-jwt-secret}
@@ -383,6 +408,8 @@ networks:
     ipam:
       config:
         - subnet: 172.31.251.0/29
+  runtime_ingress:
+    name: conductor-runtime-ingress
 
 volumes:
   postgres_data:

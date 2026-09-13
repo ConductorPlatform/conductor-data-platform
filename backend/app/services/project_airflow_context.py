@@ -76,6 +76,8 @@ async def resolve_project_airflow_context(
         project_id=project.id,
         deployment_id=deployment.id,
         deployment_generation=deployment.generation,
-        airflow_base_url=deployment.airflow_external_url,
+        # Runtime APIs are reachable only on the controlled worker/backend
+        # ingress network. The public URL is not a backend-to-runtime route.
+        airflow_base_url=f"http://airflow-{project.id}:8080",
         account_key=resolve_airflow_account(member.role.name),
     )

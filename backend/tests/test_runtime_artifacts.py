@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
 import os
-from pathlib import Path
 import shutil
 import stat
 import subprocess
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -16,7 +16,6 @@ from app.services.runtime_artifacts import (
     RuntimeArtifactWriter,
     runtime_artifact_metadata,
 )
-
 
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 FIXTURE_SECRETS = (
@@ -345,14 +344,15 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
         "airflow-scheduler",
         "airflow-dag-processor",
         "airflow-worker",
-        "workspace-session-manager",
     }
     assert "postgres" not in config["services"]
     assert "traefik" not in config["services"]
-    assert set(config["volumes"]) == {"dags", "logs", "workspaces", "ide-user-data"}
-    assert set(config["networks"]) == {"default"}
+    assert set(config["volumes"]) == {"dags", "logs"}
+    assert set(config["networks"]) == {"default", "ingress"}
     assert config["networks"]["default"]["name"] == f"conductor-p-{PROJECT_ID}_default"
-    assert config["networks"]["default"]["internal"] is True
+    assert config["networks"]["default"].get("internal") is not True
+    assert config["networks"]["ingress"]["external"] is True
+    assert config["networks"]["ingress"]["name"] == "conductor-runtime-ingress"
 
     for resource in [*config["services"].values(), *config["volumes"].values(), config["networks"]["default"]]:
         labels = resource["labels"]
@@ -363,25 +363,21 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     for service in config["services"].values():
         assert "ports" not in service
 
-    api_labels = config["services"]["airflow-api-server"]["labels"]
-    api_rule = next(value for key, value in api_labels.items() if key.endswith("-airflow.rule"))
-    assert "PathPrefix(`/api/`)" in api_rule
-    assert "PathPrefix(`/auth/`)" in api_rule
-    assert "PathPrefix(`/`)" not in api_rule
+    api_service = config["services"]["airflow-api-server"]
+    assert api_service["labels"]["traefik.enable"] == "false"
+    assert api_service["networks"]["ingress"]["aliases"] == [f"airflow-{PROJECT_ID}"]
 
     init_service = config["services"]["airflow-init"]
+    assert init_service["extra_hosts"] == ["host.docker.internal:host-gateway"]
     init_command = " ".join(init_service["command"])
     for secret in FIXTURE_SECRETS[1:]:
         assert secret not in init_command
     assert '"$$AIRFLOW_ADMIN_PASSWORD"' in init_command
     assert init_service["environment"]["AIRFLOW__CELERY__RESULT_BACKEND"].endswith(
-        f":{FIXTURE_SECRETS[0]}@postgres:5432/conductor_airflow_{PROJECT_ID}"
+        f":{FIXTURE_SECRETS[0]}@host.docker.internal:5432/conductor_airflow_{PROJECT_ID}"
     )
 
-    manager_labels = config["services"]["workspace-session-manager"]["labels"]
-    ide_rule = next(value for key, value in manager_labels.items() if key.endswith("-ide.rule"))
-    assert ide_rule == "Host(`analytics.airflow.example.test`) && PathPrefix(`/ide/analytics/`)"
-    assert any(key.endswith("forwardauth.address") for key in manager_labels)
+    assert "workspace-session-manager" not in config["services"]
 
 
 def test_template_labels_and_non_secret_artifact_outputs_never_leak_fixture_secrets(

@@ -73,7 +73,7 @@ async def test_context_is_server_derived_and_credential_free_for_project_admin(d
 
     assert context.project_id == project.id
     assert context.deployment_generation == 4
-    assert context.airflow_base_url == "https://creator-project.airflow.example.test"
+    assert context.airflow_base_url == f"http://airflow-{project.id}:8080"
     assert context.account_key == "admin"
     assert {field.name for field in fields(context)} == {
         "project_id",
