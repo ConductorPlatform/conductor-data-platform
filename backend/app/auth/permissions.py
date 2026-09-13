@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import re
-from typing import Callable
 
 from fastapi import Depends, HTTPException, Path, status
 from sqlalchemy import select
