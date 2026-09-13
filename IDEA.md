@@ -129,9 +129,9 @@ The platform orchestrates the following open-source building blocks, pre-configu
 
 ---
 
-## 7. Current Milestone: Development Sandbox (Docker Compose)
+## 7. Development Sandbox Reference (Docker Compose)
 
-The current task is to build a solid local development foundation using **Docker Compose** on an Apple Silicon machine.
+The original development sandbox uses **Docker Compose** on an Apple Silicon machine. The table below is architecture context, not a statement of current task status.
 
 ### Docker Compose Services (Airflow 3.x)
 
@@ -148,13 +148,9 @@ The current task is to build a solid local development foundation using **Docker
 | `airflow-worker` | apache/airflow:3.3.0 | Execute dbt tasks |
 | `code-server` | codercom/code-server | Per-user VS Code (dev mode: 1 instance) |
 
-### Next Steps
-1. Scaffold FastAPI project structure (Alembic migrations, config, Dockerfile)
-2. Scaffold React project (Vite + TypeScript + basic dashboard)
-3. Write `docker-compose.yml` with Airflow 3.x services
-4. Implement Git-based Dag Bundle integration
-5. Wire dbt Core into worker + code-server images
-6. Auth layer (OAuth2/OIDC)
+### Current work
+Current tasks and their acceptance criteria are maintained on the Hermes board
+`conductor-data-platform`. This document describes the product vision, not a task queue.
 
 ---
 
