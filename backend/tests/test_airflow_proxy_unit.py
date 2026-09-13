@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from app.auth.jwt import create_access_token
 from app.config import settings
 from app.database import get_db_session
 from app.main import create_app
+from app.models.user import User
 from app.services.project_airflow_context import ProjectAirflowContext
 
 
@@ -42,17 +44,31 @@ def _request(
 
 
 @pytest.mark.parametrize(
-    ("method", "expected"),
+    ("method", "path", "expected"),
     [
-        ("GET", ("project.dag.view", "read")),
-        ("HEAD", ("project.dag.view", "read")),
-        ("POST", ("project.dag.run", "write")),
-        ("PATCH", ("project.dag.run", "write")),
-        ("DELETE", ("project.dag.run", "write")),
+        ("GET", "api/v1/dags", ("project.dag.view", "read")),
+        ("HEAD", "dags/example", ("project.dag.view", "read")),
+        ("POST", "api/v1/dags/example/dagRuns", ("project.dag.run", "write")),
     ],
 )
-def test_proxy_method_permission_matrix(method, expected):
-    assert proxy._permission_for_method(method) == expected
+def test_proxy_route_permission_matrix(method, path, expected):
+    assert proxy._permission_for_proxy_route(method, path) == expected
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "api/v1/connections"),
+        ("PUT", "api/v1/variables/example"),
+        ("PATCH", "api/v1/users/example"),
+        ("DELETE", "api/v1/config"),
+    ],
+)
+def test_proxy_rejects_unsupported_non_dag_writes(method, path):
+    with pytest.raises(HTTPException) as error:
+        proxy._permission_for_proxy_route(method, path)
+
+    assert error.value.status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -145,7 +161,9 @@ async def test_proxy_accepts_an_active_user_access_token_without_forwarding_it()
 
 
 @pytest.mark.asyncio
-async def test_browser_proxy_path_rechecks_cookie_user_and_authorization(monkeypatch):
+async def test_bearer_bootstrap_establishes_browser_proxy_session_without_proxy_authorization(
+    monkeypatch,
+):
     user = SimpleNamespace(id="user-a", email="user-a@test.local", is_admin=False, is_active=True)
     context = ProjectAirflowContext(
         project_id="project-a",
@@ -197,19 +215,142 @@ async def test_browser_proxy_path_rechecks_cookie_user_and_authorization(monkeyp
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="https://conductor.test", follow_redirects=False
     ) as client:
-        bootstrap = await client.get(
-            "/api/v1/projects/project-a/airflow-iframe/home",
+        bootstrap = await client.post(
+            "/api/v1/projects/project-a/airflow-proxy/bootstrap",
             headers={"Authorization": f"Bearer {access_token}"},
         )
         proxied = await client.get("/api/v1/projects/project-a/airflow-proxy/home")
 
-    assert bootstrap.status_code == 303
+    assert bootstrap.status_code == 204
     assert proxied.status_code == 200
     assert proxied.content == b"ok"
     assert resolver_calls == [
         ("project-a", "user-a", "project.dag.view", "read"),
         ("project-a", "user-a", "project.dag.view", "read"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_non_dag_write_is_denied_before_context_session_or_upstream(monkeypatch):
+    async def forbidden_context(*_args):
+        raise AssertionError("unsupported write must be rejected before context resolution")
+
+    monkeypatch.setattr(proxy, "resolve_project_airflow_context", forbidden_context)
+
+    with pytest.raises(HTTPException) as error:
+        await proxy.airflow_proxy(
+            "project-a",
+            "api/v1/connections",
+            _request(method="POST", headers={"authorization": "Bearer user-access-token"}),
+            cast(User, SimpleNamespace(id="user-a")),
+            object(),
+        )
+
+    assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cookie_authenticated_unsafe_requests_require_same_origin_proof(monkeypatch):
+    user = SimpleNamespace(id="user-a", email="user-a@test.local", is_admin=False, is_active=True)
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=3,
+        airflow_base_url="https://airflow.project-a.test",
+        account_key="viewer",
+    )
+    resolver_calls = []
+
+    class ScalarResult:
+        def scalar_one_or_none(self):
+            return user
+
+    class Db:
+        async def execute(self, _statement):
+            return ScalarResult()
+
+    async def db_override():
+        yield Db()
+
+    async def authorize(slug, received_user, db, resource, action):
+        resolver_calls.append((slug, received_user.id, resource, action))
+        return context
+
+    async def forbidden_session(*_args):
+        raise AssertionError("CSRF rejection must happen before service-session access")
+
+    app = create_app()
+    app.dependency_overrides[get_db_session] = db_override
+    monkeypatch.setattr(proxy, "resolve_project_airflow_context", authorize)
+    monkeypatch.setattr(proxy.AirflowSessionManager, "get_session", forbidden_session)
+
+    access_token = create_access_token(user.id, user.email, user.is_admin)
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="https://conductor.test", follow_redirects=False
+    ) as client:
+        bootstrap = await client.post(
+            "/api/v1/projects/project-a/airflow-proxy/bootstrap",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        missing_proof = await client.post(
+            "/api/v1/projects/project-a/airflow-proxy/api/v1/dags/example/dagRuns"
+        )
+        mismatched_proof = await client.post(
+            "/api/v1/projects/project-a/airflow-proxy/api/v1/dags/example/dagRuns",
+            headers={"Origin": "https://attacker.test"},
+        )
+
+    assert bootstrap.status_code == 204
+    assert missing_proof.status_code == 403
+    assert mismatched_proof.status_code == 403
+    assert resolver_calls == [("project-a", "user-a", "project.dag.view", "read")]
+
+
+@pytest.mark.asyncio
+async def test_bearer_dag_run_request_bypasses_cookie_csrf_protection(monkeypatch):
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=3,
+        airflow_base_url="https://airflow.project-a.test",
+        account_key="editor",
+    )
+    resolver_calls = []
+
+    async def authorize(slug, user, db, resource, action):
+        resolver_calls.append((slug, user.id, resource, action))
+        return context
+
+    async def session_for_context(*_args):
+        return "opaque-airflow-service-cookie"
+
+    class UpstreamClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def request(self, **_kwargs):
+            return httpx.Response(200, content=b"ok")
+
+    monkeypatch.setattr(proxy, "resolve_project_airflow_context", authorize)
+    monkeypatch.setattr(proxy.AirflowSessionManager, "get_session", session_for_context)
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", UpstreamClient)
+
+    response = await proxy.airflow_proxy(
+        "project-a",
+        "api/v1/dags/example/dagRuns",
+        _request(method="POST", headers={"authorization": "Bearer user-access-token"}),
+        cast(User, SimpleNamespace(id="user-a")),
+        object(),
+    )
+
+    assert response.status_code == 200
+    assert resolver_calls == [("project-a", "user-a", "project.dag.run", "write")]
 
 
 @pytest.mark.asyncio

@@ -47,10 +47,19 @@ _RESPONSE_HEADERS_TO_DROP = _REQUEST_HEADERS_TO_DROP | frozenset(
 )
 
 
-def _permission_for_method(method: str) -> tuple[str, str]:
-    if method.upper() in _READ_METHODS:
+def _permission_for_proxy_route(method: str, path: str) -> tuple[str, str]:
+    """Map only supported proxy routes to their least-privileged RBAC pair."""
+    if method.upper() in _READ_METHODS and (
+        not path.startswith("api/") or path.startswith("api/v1/dags")
+    ):
         return "project.dag.view", "read"
-    return "project.dag.run", "write"
+    if (
+        method.upper() == "POST"
+        and len(path.split("/")) == 5
+        and (path.startswith("api/v1/dags/") and path.endswith("/dagRuns"))
+    ):
+        return "project.dag.run", "write"
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proxy path not found")
 
 
 def _validate_proxy_path(path: str) -> str:
@@ -96,6 +105,22 @@ def _forward_response_headers(headers: httpx.Headers) -> dict[str, str]:
         for name, value in headers.items()
         if name.lower() not in _RESPONSE_HEADERS_TO_DROP
     }
+
+
+def _validate_cookie_csrf(request: Request) -> None:
+    """Require a same-origin browser proof before unsafe cookie-authenticated requests."""
+    if request.method.upper() in _READ_METHODS or request.headers.get("authorization"):
+        return
+
+    proof = request.headers.get("origin") or request.headers.get("referer")
+    parsed_proof = urlsplit(proof) if proof else None
+    request_url = request.url
+    if (
+        parsed_proof is None
+        or parsed_proof.scheme.lower() != request_url.scheme.lower()
+        or parsed_proof.netloc.lower() != request_url.netloc.lower()
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF validation failed")
 
 
 async def _get_proxy_session_user(
@@ -155,6 +180,18 @@ def _issue_proxy_session(response: Response, slug: str, user: User) -> None:
     )
 
 
+@router.post("/projects/{slug}/airflow-proxy/bootstrap", status_code=status.HTTP_204_NO_CONTENT)
+async def bootstrap_airflow_proxy(
+    slug: str,
+    response: Response,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Authorize a Bearer API call and establish the scoped browser proxy session."""
+    await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
+    _issue_proxy_session(response, slug, user)
+
+
 @router.api_route(
     "/projects/{slug}/airflow-proxy/{path:path}",
     methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"],
@@ -166,9 +203,10 @@ async def airflow_proxy(
     user: User = Depends(_get_proxy_session_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    resource, action = _permission_for_method(request.method)
-    context = await resolve_project_airflow_context(slug, user, db, resource, action)
     safe_path = _validate_proxy_path(path)
+    resource, action = _permission_for_proxy_route(request.method, safe_path)
+    _validate_cookie_csrf(request)
+    context = await resolve_project_airflow_context(slug, user, db, resource, action)
     target_url = _target_url(context, safe_path)
     session = await AirflowSessionManager().get_session(context, db)
     body = await request.body()
@@ -206,8 +244,7 @@ async def airflow_iframe(
     db: AsyncSession = Depends(get_db_session),
 ):
     """Bootstrap a short-lived, project-scoped browser proxy session."""
-    resource, action = _permission_for_method("GET")
-    await resolve_project_airflow_context(slug, user, db, resource, action)
+    await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
     safe_path = _validate_proxy_path(path)
     response = RedirectResponse(
         url=f"/api/v1/projects/{slug}/airflow-proxy/{quote(safe_path, safe='/')}",
