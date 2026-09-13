@@ -28,13 +28,13 @@ class Settings(BaseSettings):
     reauth_rate_limit_attempts: int = 5
     reauth_rate_limit_window_seconds: int = 300
     trusted_proxy_cidrs: str = "127.0.0.0/8,::1/128"
+    airflow_proxy_session_ttl_seconds: int = Field(default=300, gt=0)
+    airflow_proxy_cookie_secure: bool = True
 
     # ── Durable lifecycle worker ──
     lifecycle_worker_poll_seconds: float = Field(default=1.0, gt=0, allow_inf_nan=False)
     lifecycle_worker_lease_seconds: int = Field(default=30, gt=0)
-    lifecycle_worker_heartbeat_seconds: float = Field(
-        default=10.0, gt=0, allow_inf_nan=False
-    )
+    lifecycle_worker_heartbeat_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
     lifecycle_retry_base_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     lifecycle_retry_cap_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     lifecycle_retry_jitter_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
