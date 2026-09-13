@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
 import re
+from datetime import datetime
 
 from pydantic import BaseModel, field_validator
 
@@ -44,6 +44,15 @@ class ProjectOperationResponse(BaseModel):
     id: str
     operation: LifecycleOperation
     status: LifecycleJobStatus
+
+
+class ProjectOperationStatusResponse(ProjectOperationResponse):
+    project_status: ProjectLifecycleStatus
+    current_step: str | None
+    attempt: int
+    max_attempts: int
+    error_code: str | None
+    error_message: str | None
 
 
 class ProjectCreateResponse(BaseModel):
