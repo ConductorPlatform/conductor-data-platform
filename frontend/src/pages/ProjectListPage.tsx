@@ -3,6 +3,38 @@ import { useNavigate } from 'react-router-dom';
 import { apiFetch } from '../lib/api';
 import { RoleBadge } from '../components/RoleBadge';
 
+const OPERATION_STORAGE_KEY = 'conductor_project_operations';
+const PENDING_CREATE_STORAGE_KEY = 'conductor_pending_project_creates';
+const ACTIVE_OPERATION_STATUSES = new Set(['pending', 'running', 'retry_wait']);
+
+interface StoredOperation {
+  projectId: string;
+  projectSlug: string;
+  operationId: string;
+  operation: string;
+  idempotencyKey: string;
+  status: string;
+  currentStep?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+}
+
+interface PendingCreateRequest {
+  name: string;
+  slug: string;
+  description: string | null;
+  idempotencyKey: string;
+}
+
+interface OperationResponse {
+  id: string;
+  operation: string;
+  status: string;
+  current_step?: string | null;
+  error_code?: string | null;
+  error_message?: string | null;
+}
+
 interface Project {
   id: string;
   name: string;
@@ -13,19 +45,62 @@ interface Project {
   created_at: string;
 }
 
+function loadStoredOperations(): StoredOperation[] {
+  try {
+    const stored = localStorage.getItem(OPERATION_STORAGE_KEY);
+    return stored ? JSON.parse(stored) : [];
+  } catch {
+    return [];
+  }
+}
+
+function replaceStoredOperation(operation: StoredOperation) {
+  const operations = loadStoredOperations();
+  const replacementIndex = operations.findIndex((candidate) => candidate.projectSlug === operation.projectSlug);
+  if (replacementIndex === -1) operations.push(operation);
+  else operations[replacementIndex] = operation;
+  localStorage.setItem(OPERATION_STORAGE_KEY, JSON.stringify(operations));
+  return operations;
+}
+
+function loadPendingCreates(): PendingCreateRequest[] {
+  try {
+    const stored = localStorage.getItem(PENDING_CREATE_STORAGE_KEY);
+    return stored ? JSON.parse(stored) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingCreate(request: PendingCreateRequest) {
+  const pendingCreates = loadPendingCreates().filter((candidate) => candidate.slug !== request.slug);
+  pendingCreates.push(request);
+  localStorage.setItem(PENDING_CREATE_STORAGE_KEY, JSON.stringify(pendingCreates));
+}
+
+function removePendingCreate(slug: string) {
+  localStorage.setItem(
+    PENDING_CREATE_STORAGE_KEY,
+    JSON.stringify(loadPendingCreates().filter((candidate) => candidate.slug !== slug)),
+  );
+}
+
 function CreateProjectModal({
   open,
   onClose,
   onCreated,
+  onOperationAccepted,
 }: {
   open: boolean;
   onClose: () => void;
   onCreated: () => void;
+  onOperationAccepted: (operations: StoredOperation[]) => void;
 }) {
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [idempotencyKey, setIdempotencyKey] = useState('');
 
   if (!open) return null;
 
@@ -39,19 +114,40 @@ function CreateProjectModal({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
+    const request = { name: name.trim(), slug, description: description.trim() || null };
+    const matchingPendingCreate = loadPendingCreates().find((candidate) => (
+      candidate.name === request.name
+      && candidate.slug === request.slug
+      && candidate.description === request.description
+    ));
+    const requestKey = idempotencyKey || matchingPendingCreate?.idempotencyKey || crypto.randomUUID();
+    setIdempotencyKey(requestKey);
+    savePendingCreate({ ...request, idempotencyKey: requestKey });
     setSubmitting(true);
     setError('');
     try {
-      await apiFetch('/projects', {
+      const response = await apiFetch('/projects', {
         method: 'POST',
-        body: JSON.stringify({ name: name.trim(), slug, description: description.trim() || null }),
+        headers: { 'Idempotency-Key': requestKey },
+        body: JSON.stringify(request),
+      }) as { project: Pick<Project, 'id' | 'slug'>; operation: OperationResponse };
+      const operations = replaceStoredOperation({
+        projectId: response.project.id,
+        projectSlug: response.project.slug,
+        operationId: response.operation.id,
+        operation: response.operation.operation,
+        idempotencyKey: requestKey,
+        status: response.operation.status,
       });
+      onOperationAccepted(operations);
       onCreated();
       onClose();
+      removePendingCreate(response.project.slug);
       setName('');
       setDescription('');
+      setIdempotencyKey('');
     } catch (err: any) {
-      setError(err.message || 'Failed to create project');
+      setError(`${err.message || 'Failed to create project'}. Send again will reuse the same request key.`);
     } finally {
       setSubmitting(false);
     }
@@ -111,10 +207,58 @@ function CreateProjectModal({
   );
 }
 
+function lifecycleStatusLabel(status: string) {
+  return status.replace(/_/g, ' ');
+}
+
+function OperationPanel({
+  operations,
+  onRetry,
+}: {
+  operations: StoredOperation[];
+  onRetry: (operation: StoredOperation) => Promise<void>;
+}) {
+  if (operations.length === 0) return null;
+
+  return (
+    <section className="mb-6 space-y-3" aria-label="Project provisioning operations">
+      <h2 className="text-sm font-semibold text-white">Project provisioning</h2>
+      {operations.map((operation) => (
+        <div key={operation.projectSlug} className="bg-[#1a1b23] border border-[#2a2b36] rounded-lg p-4">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-white">{operation.projectSlug}</p>
+              <p className="text-xs text-gray-400 mt-1">
+                {operation.operation} · {lifecycleStatusLabel(operation.status)}
+                {operation.currentStep ? ` · ${operation.currentStep}` : ''}
+              </p>
+            </div>
+            {operation.status === 'failed' && (
+              <button
+                type="button"
+                onClick={() => void onRetry(operation)}
+                className="px-3 py-1.5 bg-[#6366f1] text-white text-xs rounded-md hover:bg-[#4f46e5]"
+              >
+                Retry provisioning
+              </button>
+            )}
+          </div>
+          {operation.errorMessage && (
+            <p className="text-xs text-red-400 mt-3">
+              {operation.errorCode ? `${operation.errorCode}: ` : ''}{operation.errorMessage}
+            </p>
+          )}
+        </div>
+      ))}
+    </section>
+  );
+}
+
 export default function ProjectListPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [showCreate, setShowCreate] = useState(false);
+  const [operations, setOperations] = useState<StoredOperation[]>(loadStoredOperations);
   const navigate = useNavigate();
 
   const fetchProjects = () => {
@@ -127,6 +271,75 @@ export default function ProjectListPage() {
   useEffect(() => {
     fetchProjects();
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const refreshOperations = async () => {
+      const storedOperations = loadStoredOperations();
+      const activeOperations = storedOperations.filter((operation) => ACTIVE_OPERATION_STATUSES.has(operation.status));
+      if (activeOperations.length === 0) return;
+
+      const refreshed = await Promise.all(activeOperations.map(async (operation) => {
+        try {
+          const response = await apiFetch(
+            `/admin/projects/${operation.projectSlug}/operations/${operation.operationId}`,
+          ) as OperationResponse;
+          return {
+            ...operation,
+            status: response.status,
+            currentStep: response.current_step,
+            errorCode: response.error_code,
+            errorMessage: response.error_message,
+          };
+        } catch {
+          return operation;
+        }
+      }));
+
+      if (cancelled) return;
+      const nextOperations = [
+        ...storedOperations.filter((operation) => !ACTIVE_OPERATION_STATUSES.has(operation.status)),
+        ...refreshed,
+      ];
+      localStorage.setItem(OPERATION_STORAGE_KEY, JSON.stringify(nextOperations));
+      setOperations(nextOperations);
+      if (refreshed.some((operation) => operation.status === 'succeeded')) fetchProjects();
+    };
+
+    void refreshOperations();
+    const interval = window.setInterval(() => void refreshOperations(), 3_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  const retryOperation = async (operation: StoredOperation) => {
+    const retryKey = crypto.randomUUID();
+    try {
+      const response = await apiFetch(
+        `/admin/projects/${operation.projectSlug}/operations/${operation.operationId}/retry`,
+        { method: 'POST', headers: { 'Idempotency-Key': retryKey } },
+      ) as Pick<OperationResponse, 'id' | 'operation' | 'status'>;
+      setOperations(replaceStoredOperation({
+        ...operation,
+        operationId: response.id,
+        operation: response.operation,
+        idempotencyKey: retryKey,
+        status: response.status,
+        currentStep: null,
+        errorCode: null,
+        errorMessage: null,
+      }));
+    } catch (err: any) {
+      setOperations(replaceStoredOperation({
+        ...operation,
+        errorCode: 'RETRY_FAILED',
+        errorMessage: err.message || 'Retry request failed',
+      }));
+    }
+  };
 
   if (loading) return <div className="text-gray-400 p-8">Loading projects...</div>;
 
@@ -141,6 +354,8 @@ export default function ProjectListPage() {
           + New Project
         </button>
       </div>
+
+      <OperationPanel operations={operations} onRetry={retryOperation} />
 
       <div className="grid grid-cols-2 gap-4">
         {projects.map((p) => (
@@ -171,6 +386,7 @@ export default function ProjectListPage() {
         open={showCreate}
         onClose={() => setShowCreate(false)}
         onCreated={fetchProjects}
+        onOperationAccepted={setOperations}
       />
     </div>
   );
