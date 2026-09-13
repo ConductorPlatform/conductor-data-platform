@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import re
 import shutil
 import stat
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from app.services.lifecycle_errors import InvalidTemplateError
 from app.services.project_lifecycle import validate_runtime_parameters
-
 
 _PROJECT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SLUG_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62})$")
@@ -177,6 +176,7 @@ def _allowlisted_env(spec: RuntimeArtifactSpec) -> dict[str, str]:
         "CONDUCTOR_TEMPLATE_VERSION": spec.template_version,
         "PROJECT_SLUG": spec.project_slug,
         "AIRFLOW_EXTERNAL_HOST": airflow_host,
+        "AIRFLOW_INTERNAL_ALIAS": f"airflow-{spec.project_id}",
         "AIRFLOW_DB_NAME": spec.airflow_db_name,
         "AIRFLOW_DB_ROLE": spec.airflow_db_role,
         "AIRFLOW_DB_PASSWORD_URLENCODED": quote(spec.airflow_db_password, safe=""),

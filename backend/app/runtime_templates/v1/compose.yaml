@@ -4,9 +4,9 @@ x-airflow-environment: &airflow-environment
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "False"
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@postgres:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@host.docker.internal:5432/${AIRFLOW_DB_NAME}
     AIRFLOW__CELERY__BROKER_URL: redis://project-redis:6379/0
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@postgres:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@host.docker.internal:5432/${AIRFLOW_DB_NAME}
     AIRFLOW__API__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080
 
 x-airflow-common: &airflow-common
@@ -15,6 +15,8 @@ x-airflow-common: &airflow-common
   volumes:
     - dags:/opt/airflow/dags
     - logs:/opt/airflow/logs
+  extra_hosts:
+    - host.docker.internal:host-gateway
   depends_on:
     project-redis:
       condition: service_healthy
@@ -64,15 +66,16 @@ services:
   airflow-api-server:
     <<: *airflow-common
     command: airflow api-server --apps all
+    networks:
+      default: {}
+      ingress:
+        aliases:
+          - ${AIRFLOW_INTERNAL_ALIAS}
     labels:
       - conductor.managed=true
       - conductor.project_id=${CONDUCTOR_PROJECT_ID}
       - conductor.template_version=${CONDUCTOR_TEMPLATE_VERSION}
-      - traefik.enable=true
-      - traefik.docker.network=${COMPOSE_PROJECT_NAME}_default
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-airflow.rule=Host(`${AIRFLOW_EXTERNAL_HOST}`) && (PathPrefix(`/api/`) || PathPrefix(`/auth/`))
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-airflow.entrypoints=websecure
-      - traefik.http.services.conductor-${CONDUCTOR_PROJECT_ID}-airflow.loadbalancer.server.port=8080
+      - traefik.enable=false
 
   airflow-scheduler:
     <<: *airflow-common
@@ -86,35 +89,16 @@ services:
     <<: *airflow-common
     command: airflow celery worker
 
-  workspace-session-manager:
-    image: conductor-workspace-session-manager:latest
-    environment:
-      CONDUCTOR_PROJECT_ID: ${CONDUCTOR_PROJECT_ID}
-      CONDUCTOR_PROJECT_SLUG: ${PROJECT_SLUG}
-    volumes:
-      - workspaces:/workspace
-      - ide-user-data:/ide-data
-    labels:
-      - conductor.managed=true
-      - conductor.project_id=${CONDUCTOR_PROJECT_ID}
-      - conductor.template_version=${CONDUCTOR_TEMPLATE_VERSION}
-      - traefik.enable=true
-      - traefik.docker.network=${COMPOSE_PROJECT_NAME}_default
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-ide.rule=Host(`${AIRFLOW_EXTERNAL_HOST}`) && PathPrefix(`/ide/${PROJECT_SLUG}/`)
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-ide.entrypoints=websecure
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-ide.middlewares=conductor-${CONDUCTOR_PROJECT_ID}-ide-auth
-      - traefik.http.middlewares.conductor-${CONDUCTOR_PROJECT_ID}-ide-auth.forwardauth.address=http://fastapi:8000/api/v1/internal/ide/authorize
-      - traefik.http.middlewares.conductor-${CONDUCTOR_PROJECT_ID}-ide-auth.forwardauth.trustForwardHeader=true
-      - traefik.http.services.conductor-${CONDUCTOR_PROJECT_ID}-ide.loadbalancer.server.port=8080
-
 networks:
   default:
     name: ${COMPOSE_PROJECT_NAME}_default
-    internal: true
     labels:
       conductor.managed: "true"
       conductor.project_id: ${CONDUCTOR_PROJECT_ID}
       conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
+  ingress:
+    name: conductor-runtime-ingress
+    external: true
 
 volumes:
   dags:
@@ -123,16 +107,6 @@ volumes:
       conductor.project_id: ${CONDUCTOR_PROJECT_ID}
       conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
   logs:
-    labels:
-      conductor.managed: "true"
-      conductor.project_id: ${CONDUCTOR_PROJECT_ID}
-      conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
-  workspaces:
-    labels:
-      conductor.managed: "true"
-      conductor.project_id: ${CONDUCTOR_PROJECT_ID}
-      conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
-  ide-user-data:
     labels:
       conductor.managed: "true"
       conductor.project_id: ${CONDUCTOR_PROJECT_ID}

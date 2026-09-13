@@ -80,7 +80,7 @@ async def test_context_returns_only_safe_server_derived_fields(monkeypatch):
         project_id="project-a",
         deployment_id="deployment-a",
         deployment_generation=7,
-        airflow_base_url="https://a.airflow.example.test",
+        airflow_base_url="http://airflow-project-a:8080",
         account_key="dev",
     )
     assert not any("password" in field or "secret" in field for field in vars(context))
@@ -148,7 +148,7 @@ async def test_session_cache_is_scoped_to_deployment_generation_and_account(monk
         project_id="project-a",
         deployment_id="deployment-a",
         deployment_generation=7,
-        airflow_base_url="https://a.airflow.example.test",
+        airflow_base_url="http://airflow-project-a:8080",
         account_key="dev",
     )
     db = _SessionDb(SimpleNamespace(project_id="project-a", generation=7))
@@ -177,7 +177,7 @@ async def test_session_rejects_a_stale_context_before_decryption(monkeypatch):
         project_id="project-a",
         deployment_id="deployment-a",
         deployment_generation=7,
-        airflow_base_url="https://a.airflow.example.test",
+        airflow_base_url="http://airflow-project-a:8080",
         account_key="admin",
     )
     stale_deployment = SimpleNamespace(project_id="project-b", generation=7)
