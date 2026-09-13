@@ -6,13 +6,12 @@ from typing import Callable
 from fastapi import Depends, HTTPException, Path, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.auth.deps import get_current_user
 from app.database import get_db_session
 from app.models.project import Project
 from app.models.project_member import ProjectMember
-from app.models.role import Permission, Role
+from app.models.role import Permission
 from app.models.user import User
 
 
@@ -58,7 +57,6 @@ async def check_permission(
             ProjectMember.project_id == project_id,
             ProjectMember.user_id == user.id,
         )
-        .options(selectinload(ProjectMember.role).selectinload(Role.permissions))
     )
     result = await db.execute(stmt)
     member = result.scalar_one_or_none()
@@ -66,8 +64,10 @@ async def check_permission(
     if member is None:
         return False
 
-    # Check each permission on the role
-    for perm in member.role.permissions:
+    # Query permissions directly rather than relying on a relationship cached
+    # earlier in the request; grants made in this session must apply immediately.
+    permissions = await db.execute(select(Permission).where(Permission.role_id == member.role_id))
+    for perm in permissions.scalars():
         if _match_resource(perm.resource, resource) and _match_action(
             perm.action, action
         ):
