@@ -4,6 +4,7 @@ x-airflow-environment: &airflow-environment
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "False"
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@host.docker.internal:5432/${AIRFLOW_DB_NAME}
     AIRFLOW__CELERY__BROKER_URL: redis://project-redis:6379/0
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@host.docker.internal:5432/${AIRFLOW_DB_NAME}
@@ -58,10 +59,7 @@ services:
       - -c
       - >-
         airflow db migrate &&
-        airflow users create --username "$$AIRFLOW_ADMIN_USER" --password "$$AIRFLOW_ADMIN_PASSWORD" --firstname Admin --lastname User --role Admin --email admin@conductor.local &&
-        airflow users create --username "$$AIRFLOW_DEV_USER" --password "$$AIRFLOW_DEV_PASSWORD" --firstname Developer --lastname User --role User --email dev@conductor.local &&
-        airflow users create --username "$$AIRFLOW_VIEWER_USER" --password "$$AIRFLOW_VIEWER_PASSWORD" --firstname Viewer --lastname User --role Viewer --email viewer@conductor.local &&
-        airflow users create --username "$$AIRFLOW_INTEGRATION_USER" --password "$$AIRFLOW_INTEGRATION_PASSWORD" --firstname Integration --lastname User --role Viewer --email integration@conductor.local
+        python /home/airflow/bootstrap_airflow_users.py
 
   airflow-api-server:
     <<: *airflow-common

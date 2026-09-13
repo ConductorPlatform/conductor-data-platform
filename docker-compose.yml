@@ -7,87 +7,14 @@
 # Secrets are read from .env at project root (gitignored).
 # See .env.example for all available variables.
 
-# ── Airflow environment variables (separate anchor for merge support) ──
-x-airflow-env: &airflow-env
-  # Core
-  AIRFLOW__CORE__EXECUTOR: CeleryExecutor
-  AIRFLOW__CORE__LOAD_EXAMPLES: "False"
-  AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-
-  # Auth
-  AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-  AIRFLOW__API_AUTH__JWT_SECRET: ${CONDUCTOR_JWT_SECRET:-conductor-dev-jwt-secret-change-in-prod}
-
-  # Database — overridden per project
-  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
-    postgresql+psycopg2://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/${CONDUCTOR_DB_NAME:-conductor}
-
-  # Celery
-  AIRFLOW__CELERY__BROKER_URL: >-
-    redis://${CONDUCTOR_REDIS_HOST:-redis}:${CONDUCTOR_REDIS_PORT:-6379}/${CONDUCTOR_REDIS_DB:-0}
-  AIRFLOW__CELERY__RESULT_BACKEND: >-
-      db+postgresql://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/${CONDUCTOR_DB_NAME:-conductor}
-
-  # API Server
-  AIRFLOW__API__BASE_URL: http://localhost:8080
-  AIRFLOW__API__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080
-
-  # Dag Processor
-  AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
-  AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: >-
-    [{"name":"local-dags","classpath":"airflow.dag_processing.bundles.local.LocalDagBundle","kwargs":{"path":"/opt/airflow/dags"}}]
-
-  # _AIRFLOW_WWW_USER_PASSWORD removed — unused in Airflow 3.x
-  # Admin user created via `airflow users create` in airflow-db-init
-
-# ── Airflow common service config ──
-x-airflow-common: &airflow-common
+# ── Canonical project-runtime image ──
+# Build and tag exactly the image consumed by rendered per-project Compose.
+x-airflow-runtime-image: &airflow-runtime-image
   build:
     context: ./docker/airflow
     args:
       AIRFLOW_VERSION: 3.3.0
-  environment:
-    <<: *airflow-env
-    _AIRFLOW_DB_MIGRATE: "false"
-  volumes:
-    - ./dags:/opt/airflow/dags
-    - ./logs:/opt/airflow/logs
-    - ./plugins:/opt/airflow/plugins
-  depends_on:
-    postgres:
-      condition: service_healthy
-    redis:
-      condition: service_started
-  restart: unless-stopped
-
-# ── Per-project Airflow environment overrides ──
-x-airflow-dw: &airflow-dw
-  <<: *airflow-env
-  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
-    postgresql+psycopg2://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/airflow_dw
-  AIRFLOW__CELERY__BROKER_URL: >-
-    redis://${CONDUCTOR_REDIS_HOST:-redis}:${CONDUCTOR_REDIS_PORT:-6379}/3
-  AIRFLOW__CELERY__RESULT_BACKEND: >-
-    db+postgresql://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/airflow_dw
-  AIRFLOW__API__BASE_URL: http://localhost:8081
-  AIRFLOW__API__EXECUTION_API_SERVER_URL: http://airflow-dw-api-server:8080
-  AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-  AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: >-
-    [{"name":"local-dags","classpath":"airflow.dag_processing.bundles.local.LocalDagBundle","kwargs":{"path":"/opt/airflow/dags"}}]
-
-x-airflow-mktg: &airflow-mktg
-  <<: *airflow-env
-  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
-    postgresql+psycopg2://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/airflow_mktg
-  AIRFLOW__CELERY__BROKER_URL: >-
-    redis://${CONDUCTOR_REDIS_HOST:-redis}:${CONDUCTOR_REDIS_PORT:-6379}/4
-  AIRFLOW__CELERY__RESULT_BACKEND: >-
-    db+postgresql://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/airflow_mktg
-  AIRFLOW__API__BASE_URL: http://localhost:8082
-  AIRFLOW__API__EXECUTION_API_SERVER_URL: http://airflow-mktg-api-server:8080
-  AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-  AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: >-
-    [{"name":"local-dags","classpath":"airflow.dag_processing.bundles.local.LocalDagBundle","kwargs":{"path":"/opt/airflow/dags"}}]
+  image: conductor-airflow:latest
 
 services:
 
@@ -125,7 +52,9 @@ services:
   fastapi:
     build: ./backend
     image: conductor-backend:latest
-    env_file: ./backend/.env
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
       CONDUCTOR_DATABASE_URL: >-
         postgresql+asyncpg://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/${CONDUCTOR_DB_NAME:-conductor}
@@ -134,6 +63,9 @@ services:
       CONDUCTOR_SECRET_KEY: ${CONDUCTOR_JWT_SECRET:-conductor-dev-jwt-secret-change-in-prod}
       CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY: ${CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY:?Set CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY to a stable Fernet key}
       CONDUCTOR_TRUSTED_PROXY_CIDRS: "${CONDUCTOR_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}"
+      # The Settings default remains Secure for production HTTPS. This explicit
+      # localhost-only Compose override permits browser proxy cookies on HTTP.
+      CONDUCTOR_AIRFLOW_PROXY_COOKIE_SECURE: "false"
       CONDUCTOR_CODE_SERVER_HOST: http://code-server:8080
       CONDUCTOR_CODE_SERVER_JWT_SECRET: ${CONDUCTOR_CODE_SERVER_JWT_SECRET:-conductor-cs-jwt-secret}
     ports:
@@ -166,7 +98,9 @@ services:
   lifecycle-worker:
     build: ./backend
     image: conductor-backend:latest
-    env_file: ./backend/.env
+    env_file:
+      - path: ./backend/.env
+        required: false
     command: python -m app.workers.lifecycle
     environment:
       CONDUCTOR_DATABASE_URL: >-
@@ -191,181 +125,12 @@ services:
   #     - "3000:80"
   #   depends_on: [fastapi]
 
-  # ─── Airflow 3.x — DB Init (run once with --profile init) ───
-  airflow-db-init:
-    <<: *airflow-common
-    restart: "no"
-    environment:
-      <<: *airflow-env
-      _AIRFLOW_DB_MIGRATE: "true"
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        airflow db migrate &&
-        airflow users create \
-          --username admin \
-          --password ${CONDUCTOR_AIRFLOW_ADMIN_PASSWORD:-admin} \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email admin@conductor.local
+  # Build-only target. It is explicitly profiled out of `docker compose up`;
+  # project runtimes are created solely by lifecycle-worker from the template.
+  project-airflow-runtime-image:
+    <<: *airflow-runtime-image
     profiles:
-      - init
-
-  # ─── Airflow 3.x — Scheduler ───
-  airflow-scheduler:
-    <<: *airflow-common
-    command: airflow scheduler
-
-  # ─── Airflow 3.x — Dag Processor ───
-  airflow-dag-processor:
-    <<: *airflow-common
-    command: airflow dag-processor
-
-  # ─── Airflow 3.x — API Server (UI + REST + Task SDK) ───
-  airflow-api-server:
-    <<: *airflow-common
-    command: airflow api-server --apps all
-    ports:
-      - "8080:8080"
-
-  # ─── Airflow 3.x — Celery Worker ───
-  airflow-worker:
-    <<: *airflow-common
-    command: airflow celery worker
-
-  # ─── Data Warehouse Airflow ───
-
-  airflow-dw-db-init:
-    <<: *airflow-common
-    restart: "no"
-    environment:
-      <<: *airflow-dw
-      _AIRFLOW_DB_MIGRATE: "true"
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        airflow db migrate &&
-        airflow users create \
-          --username admin \
-          --password ${CONDUCTOR_AIRFLOW_ADMIN_PASSWORD:-admin} \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email admin@conductor.local &&
-        python3 /home/airflow/create_airflow_users.py data-warehouse
-    volumes:
-      - ./dags/data-warehouse:/opt/airflow/dags
-      - ./logs/data-warehouse:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-    profiles:
-      - init
-
-  airflow-dw-scheduler:
-    <<: *airflow-common
-    environment: *airflow-dw
-    command: airflow scheduler
-    volumes:
-      - ./dags/data-warehouse:/opt/airflow/dags
-      - ./logs/data-warehouse:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-
-  airflow-dw-dag-processor:
-    <<: *airflow-common
-    environment: *airflow-dw
-    command: airflow dag-processor
-    volumes:
-      - ./dags/data-warehouse:/opt/airflow/dags
-      - ./logs/data-warehouse:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-
-  airflow-dw-api-server:
-    <<: *airflow-common
-    environment: *airflow-dw
-    command: airflow api-server --apps all
-    ports:
-      - "8081:8080"
-    volumes:
-      - ./dags/data-warehouse:/opt/airflow/dags
-      - ./logs/data-warehouse:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-
-  airflow-dw-worker:
-    <<: *airflow-common
-    environment: *airflow-dw
-    command: airflow celery worker
-    volumes:
-      - ./dags/data-warehouse:/opt/airflow/dags
-      - ./logs/data-warehouse:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-
-  # ─── Marketing Airflow ───
-
-  airflow-mktg-db-init:
-    <<: *airflow-common
-    restart: "no"
-    environment:
-      <<: *airflow-mktg
-      _AIRFLOW_DB_MIGRATE: "true"
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        airflow db migrate &&
-        airflow users create \
-          --username admin \
-          --password ${CONDUCTOR_AIRFLOW_ADMIN_PASSWORD:-admin} \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email admin@conductor.local &&
-        python3 /home/airflow/create_airflow_users.py marketing
-    volumes:
-      - ./dags/marketing:/opt/airflow/dags
-      - ./logs/marketing:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-    profiles:
-      - init
-
-  airflow-mktg-scheduler:
-    <<: *airflow-common
-    environment: *airflow-mktg
-    command: airflow scheduler
-    volumes:
-      - ./dags/marketing:/opt/airflow/dags
-      - ./logs/marketing:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-
-  airflow-mktg-dag-processor:
-    <<: *airflow-common
-    environment: *airflow-mktg
-    command: airflow dag-processor
-    volumes:
-      - ./dags/marketing:/opt/airflow/dags
-      - ./logs/marketing:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-
-  airflow-mktg-api-server:
-    <<: *airflow-common
-    environment: *airflow-mktg
-    command: airflow api-server --apps all
-    ports:
-      - "8082:8080"
-    volumes:
-      - ./dags/marketing:/opt/airflow/dags
-      - ./logs/marketing:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
-
-  airflow-mktg-worker:
-    <<: *airflow-common
-    environment: *airflow-mktg
-    command: airflow celery worker
-    volumes:
-      - ./dags/marketing:/opt/airflow/dags
-      - ./logs/marketing:/opt/airflow/logs
-      - ./plugins:/opt/airflow/plugins
+      - airflow-image-build
 
   # ─── code-server (multiuser, JWT auth) ───
   code-server:

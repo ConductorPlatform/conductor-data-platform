@@ -244,7 +244,20 @@ def test_airflow_init_uses_container_environment_not_compose_interpolated_creden
         "AIRFLOW_INTEGRATION_USER",
         "AIRFLOW_INTEGRATION_PASSWORD",
     ):
-        assert f'"$${variable}"' in init_service
+        assert f"{variable}: ${{{variable}}}" in init_service
+    assert "AIRFLOW__CORE__AUTH_MANAGER" in init_service
+    assert "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager" in init_service
+    assert "python /home/airflow/bootstrap_airflow_users.py" in init_service
+
+
+def test_canonical_airflow_image_includes_fab_and_resumable_cli_bootstrap() -> None:
+    dockerfile = (TEMPLATE_PATH.parents[4] / "docker" / "airflow" / "Dockerfile").read_text()
+    bootstrap = (TEMPLATE_PATH.parents[4] / "docker" / "airflow" / "bootstrap_airflow_users.py").read_text()
+
+    assert '"apache-airflow-providers-fab"' in dockerfile
+    assert "bootstrap_airflow_users.py" in dockerfile
+    assert '"users",\n            "create",' in bootstrap
+    assert '"users", "list", "--output", "json"' in bootstrap
 
 
 def test_failed_second_artifact_write_never_publishes_a_partial_generation(
@@ -368,11 +381,14 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     assert api_service["networks"]["ingress"]["aliases"] == [f"airflow-{PROJECT_ID}"]
 
     init_service = config["services"]["airflow-init"]
-    assert init_service["extra_hosts"] == ["host.docker.internal:host-gateway"]
+    assert init_service["extra_hosts"] in (
+        ["host.docker.internal:host-gateway"],
+        ["host.docker.internal=host-gateway"],
+    )
     init_command = " ".join(init_service["command"])
     for secret in FIXTURE_SECRETS[1:]:
         assert secret not in init_command
-    assert '"$$AIRFLOW_ADMIN_PASSWORD"' in init_command
+    assert "python /home/airflow/bootstrap_airflow_users.py" in init_command
     assert init_service["environment"]["AIRFLOW__CELERY__RESULT_BACKEND"].endswith(
         f":{FIXTURE_SECRETS[0]}@host.docker.internal:5432/conductor_airflow_{PROJECT_ID}"
     )
