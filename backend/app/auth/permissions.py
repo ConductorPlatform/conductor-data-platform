@@ -51,12 +51,9 @@ async def check_permission(
         return True
 
     # Find user's role in the project
-    stmt = (
-        select(ProjectMember)
-        .where(
-            ProjectMember.project_id == project_id,
-            ProjectMember.user_id == user.id,
-        )
+    stmt = select(ProjectMember).where(
+        ProjectMember.project_id == project_id,
+        ProjectMember.user_id == user.id,
     )
     result = await db.execute(stmt)
     member = result.scalar_one_or_none()
@@ -68,9 +65,7 @@ async def check_permission(
     # earlier in the request; grants made in this session must apply immediately.
     permissions = await db.execute(select(Permission).where(Permission.role_id == member.role_id))
     for perm in permissions.scalars():
-        if _match_resource(perm.resource, resource) and _match_action(
-            perm.action, action
-        ):
+        if _match_resource(perm.resource, resource) and _match_action(perm.action, action):
             return True
 
     return False
