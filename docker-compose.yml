@@ -133,7 +133,7 @@ services:
         redis://${CONDUCTOR_REDIS_HOST:-redis}:${CONDUCTOR_REDIS_PORT:-6379}/1
       CONDUCTOR_SECRET_KEY: ${CONDUCTOR_JWT_SECRET:-conductor-dev-jwt-secret-change-in-prod}
       CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY: ${CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY:?Set CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY to a stable Fernet key}
-      CONDUCTOR_TRUSTED_PROXY_CIDRS: "${CONDUCTOR_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128,172.31.251.3/32}"
+      CONDUCTOR_TRUSTED_PROXY_CIDRS: "${CONDUCTOR_TRUSTED_PROXY_CIDRS:-127.0.0.0/8,::1/128}"
       CONDUCTOR_CODE_SERVER_HOST: http://code-server:8080
       CONDUCTOR_CODE_SERVER_JWT_SECRET: ${CONDUCTOR_CODE_SERVER_JWT_SECRET:-conductor-cs-jwt-secret}
     ports:
@@ -393,8 +393,7 @@ services:
     ports:
       - "3000:3000"
     networks:
-      frontend_backend:
-        ipv4_address: 172.31.251.3
+      frontend_backend: {}
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
@@ -405,9 +404,6 @@ services:
 networks:
   frontend_backend:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.31.251.0/29
   runtime_ingress:
     name: conductor-runtime-ingress
 
