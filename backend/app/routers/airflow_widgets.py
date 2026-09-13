@@ -3,80 +3,18 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.auth.deps import get_current_user
 from app.database import get_db_session
-from app.models.airflow_instance import AirflowInstance
-from app.models.project_member import ProjectMember
 from app.models.user import User
-from app.routers.airflow_proxy import _resolve_airflow
 from app.schemas.airflow import AirflowStatsResponse
 from app.schemas.dag import DAGRunInfo, DAGSummary
 from app.services.airflow_session import AirflowSessionManager
-from app.services.project_access import load_ready_project_for_user
+from app.services.project_airflow_context import resolve_project_airflow_context
 
 router = APIRouter()
-
-ROLE_ACCOUNT_MAP: dict[str, str] = {
-    "super_admin": "admin",
-    "project_admin": "admin",
-    "maintainer": "dev",
-    "developer": "dev",
-    "viewer": "viewer",
-}
-
-_airflow_sessions: dict[str, str] = {}
-
-
-async def _get_session(instance: AirflowInstance, account_key: str) -> str:
-    cache_key = f"{instance.id}_{account_key}"
-    if cache_key in _airflow_sessions:
-        return _airflow_sessions[cache_key]
-
-    if account_key == "admin":
-        username, password = instance.admin_user, instance.admin_password_encrypted
-    elif account_key == "dev":
-        username, password = instance.dev_user, instance.dev_password_encrypted
-    else:
-        username, password = instance.viewer_user, instance.viewer_password_encrypted
-
-    if not password:
-        raise HTTPException(status_code=500, detail="Airflow not configured")
-
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            f"{instance.internal_url}/api/v1/login/",
-            data={"username": username, "password": password},
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Airflow login failed")
-        session_val = ""
-        for cookie in resp.cookies.jar:
-            if cookie.name == "session":
-                session_val = cookie.value or ""
-                _airflow_sessions[cache_key] = session_val
-                return session_val
-    return ""
-
-
-async def _get_airflow(project_slug: str, user: User, db: AsyncSession) -> tuple[AirflowInstance, str]:
-    proj = await load_ready_project_for_user(project_slug, user, db)
-    inst = (await db.execute(select(AirflowInstance).where(AirflowInstance.project_id == proj.id))).scalar_one_or_none()
-    if not inst:
-        raise HTTPException(404, "Airflow not provisioned")
-    if user.is_admin:
-        return inst, "admin"
-    member = (await db.execute(
-        select(ProjectMember).where(ProjectMember.project_id == proj.id, ProjectMember.user_id == user.id)
-        .options(selectinload(ProjectMember.role))
-    )).scalar_one_or_none()
-    key = ROLE_ACCOUNT_MAP.get(member.role.name if member else "viewer", "viewer")
-    return inst, key
 
 
 @router.get("/projects/{slug}/airflow/dags", response_model=list[DAGSummary])
@@ -85,11 +23,11 @@ async def list_dags(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    inst, key = await _get_airflow(slug, user, db)
-    session = await _get_session(inst, key)
+    context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
+    session = await AirflowSessionManager().get_session(context, db)
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{inst.internal_url}/api/v1/dags",
+            f"{context.airflow_base_url}/api/v1/dags",
             cookies={"session": session},
         )
     if resp.status_code != 200:
@@ -97,29 +35,30 @@ async def list_dags(
     data = resp.json()
     return [
         DAGSummary(
-            dag_id=d["dag_id"],
-            description=d.get("description"),
-            is_paused=d.get("is_paused", False),
+            dag_id=dag["dag_id"],
+            description=dag.get("description"),
+            is_paused=dag.get("is_paused", False),
             latest_run_state=None,
             latest_run_start=None,
             latest_run_end=None,
             next_dagrun=None,
         )
-        for d in data.get("dags", [])
+        for dag in data.get("dags", [])
     ]
 
 
 @router.get("/projects/{slug}/airflow/dags/{dag_id}/runs", response_model=list[DAGRunInfo])
 async def list_dag_runs(
-    slug: str, dag_id: str,
+    slug: str,
+    dag_id: str,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
 ):
-    inst, key = await _get_airflow(slug, user, db)
-    session = await _get_session(inst, key)
+    context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
+    session = await AirflowSessionManager().get_session(context, db)
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{inst.internal_url}/api/v1/dags/{dag_id}/dagRuns",
+            f"{context.airflow_base_url}/api/v1/dags/{dag_id}/dagRuns",
             cookies={"session": session},
         )
     if resp.status_code != 200:
@@ -127,32 +66,15 @@ async def list_dag_runs(
     data = resp.json()
     return [
         DAGRunInfo(
-            run_id=r["dag_run_id"],
-            state=r.get("state", ""),
-            execution_date=r.get("execution_date", ""),
-            start_date=r.get("start_date"),
-            end_date=r.get("end_date"),
-            duration=r.get("duration"),
+            run_id=run["dag_run_id"],
+            state=run.get("state", ""),
+            execution_date=run.get("execution_date", ""),
+            start_date=run.get("start_date"),
+            end_date=run.get("end_date"),
+            duration=run.get("duration"),
         )
-        for r in data.get("dag_runs", [])
+        for run in data.get("dag_runs", [])
     ]
-
-
-@router.get("/projects/{slug}/airflow-iframe/{path:path}")
-async def airflow_iframe(
-    slug: str, path: str,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
-):
-    inst, key = await _get_airflow(slug, user, db)
-    session = await _get_session(inst, key)
-    html = f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"></head><body>
-<script>
-document.cookie = "session={session}; path=/; SameSite=Lax";
-window.location.href = "{inst.internal_url}/{path}";
-</script></body></html>"""
-    return Response(content=html, media_type="text/html")
 
 
 @router.get("/projects/{slug}/airflow/stats", response_model=AirflowStatsResponse)
@@ -162,39 +84,45 @@ async def get_airflow_stats(
     db: AsyncSession = Depends(get_db_session),
 ):
     """Aggregate DAG statistics from Airflow REST API."""
-    instance, account_key = await _resolve_airflow(slug, user, db)
-    mgr = AirflowSessionManager()
-    session = await mgr.get_session(instance, account_key)
+    context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
+    session = await AirflowSessionManager().get_session(context, db)
 
     async with httpx.AsyncClient() as client:
         cookies = {"session": session}
-        base = f"{instance.internal_url}/api/v1"
+        base = f"{context.airflow_base_url}/api/v1"
 
-        # Active / paused DAG counts
         dags_resp = await client.get(f"{base}/dags", cookies=cookies)
         dags_data = dags_resp.json() if dags_resp.status_code == 200 else {}
-        active = sum(1 for d in dags_data.get("dags", []) if not d.get("is_paused", False))
-        paused = sum(1 for d in dags_data.get("dags", []) if d.get("is_paused", False))
+        active = sum(1 for dag in dags_data.get("dags", []) if not dag.get("is_paused", False))
+        paused = sum(1 for dag in dags_data.get("dags", []) if dag.get("is_paused", False))
 
-        # Running count
         running_resp = await client.get(f"{base}/dagRuns?state=running&limit=100", cookies=cookies)
-        running = running_resp.json().get("total_entries", 0) if running_resp.status_code == 200 else 0
+        running = (
+            running_resp.json().get("total_entries", 0) if running_resp.status_code == 200 else 0
+        )
 
-        # Queued count
         queued_resp = await client.get(f"{base}/dagRuns?state=queued&limit=100", cookies=cookies)
         queued = queued_resp.json().get("total_entries", 0) if queued_resp.status_code == 200 else 0
 
-        # Runs today
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        today_resp = await client.get(f"{base}/dagRuns?start_date_gte={today}&limit=200", cookies=cookies)
-        runs_today = today_resp.json().get("total_entries", 0) if today_resp.status_code == 200 else 0
+        today = (
+            datetime.now(timezone.utc)
+            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .isoformat()
+        )
+        today_resp = await client.get(
+            f"{base}/dagRuns?start_date_gte={today}&limit=200", cookies=cookies
+        )
+        runs_today = (
+            today_resp.json().get("total_entries", 0) if today_resp.status_code == 200 else 0
+        )
 
-        # Failed last 24h
         last_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         failed_resp = await client.get(
             f"{base}/dagRuns?start_date_gte={last_24h}&state=failed&limit=100", cookies=cookies
         )
-        failed_24h = failed_resp.json().get("total_entries", 0) if failed_resp.status_code == 200 else 0
+        failed_24h = (
+            failed_resp.json().get("total_entries", 0) if failed_resp.status_code == 200 else 0
+        )
 
     return AirflowStatsResponse(
         active_dags=active,

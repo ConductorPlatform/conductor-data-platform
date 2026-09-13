@@ -3,9 +3,12 @@ from __future__ import annotations
 import httpx
 import redis.asyncio as aioredis
 from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.airflow_instance import AirflowInstance
+from app.models.project_deployment import ProjectDeployment
+from app.services.crypto import decrypt_token
+from app.services.project_airflow_context import ProjectAirflowContext
 
 
 class AirflowSessionManager:
@@ -19,46 +22,56 @@ class AirflowSessionManager:
             self._redis = aioredis.from_url(settings.redis_url, decode_responses=True)
         return self._redis
 
-    async def get_session(self, instance: AirflowInstance, account_key: str) -> str:
-        """Get session cookie — from Redis cache or fresh login."""
-        cache_key = f"airflow_session:{instance.id}:{account_key}"
-        r = await self._get_redis()
-        cached = await r.get(cache_key)
+    async def get_session(self, context: ProjectAirflowContext, db: AsyncSession) -> str:
+        """Get a cached service session without exposing credential material."""
+        cache_key = (
+            f"airflow_session:{context.deployment_id}:"
+            f"{context.deployment_generation}:{context.account_key}"
+        )
+        deployment = await db.get(ProjectDeployment, context.deployment_id)
+        if (
+            deployment is None
+            or deployment.project_id != context.project_id
+            or deployment.generation != context.deployment_generation
+        ):
+            raise HTTPException(status_code=404, detail="Airflow not provisioned")
+
+        redis = await self._get_redis()
+        cached = await redis.get(cache_key)
         if cached:
             return cached
 
-        # Map account_key to actual credentials
-        if account_key == "admin":
-            username = instance.admin_user
-            password = instance.admin_password_encrypted
-        elif account_key == "dev":
-            username = instance.dev_user
-            password = instance.dev_password_encrypted
+        if context.account_key == "admin":
+            username = deployment.airflow_admin_user
+            encrypted_password = deployment.airflow_admin_password_encrypted
+        elif context.account_key == "dev":
+            username = deployment.airflow_dev_user
+            encrypted_password = deployment.airflow_dev_password_encrypted
         else:
-            username = instance.viewer_user
-            password = instance.viewer_password_encrypted
+            username = deployment.airflow_viewer_user
+            encrypted_password = deployment.airflow_viewer_password_encrypted
 
-        if not password:
-            raise HTTPException(status_code=500, detail="Airflow credentials not configured")
+        try:
+            password = decrypt_token(encrypted_password)
+            async with httpx.AsyncClient() as client:
+                login_response = await client.post(
+                    f"{context.airflow_base_url}/api/v1/login/",
+                    data={"username": username, "password": password},
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+        except Exception as error:
+            raise HTTPException(status_code=502, detail="Airflow authentication failed") from error
 
-        # Login via Airflow REST API
-        async with httpx.AsyncClient() as client:
-            login_resp = await client.post(
-                f"{instance.internal_url}/api/v1/login/",
-                data={"username": username, "password": password},
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-            )
-            if login_resp.status_code != 200:
-                raise HTTPException(status_code=502, detail="Failed to authenticate with Airflow")
+        if login_response.status_code != 200:
+            raise HTTPException(status_code=502, detail="Airflow authentication failed")
 
-            session_cookie = login_resp.cookies.get("session")
-            if not session_cookie:
-                for cookie in login_resp.cookies.jar:
-                    if cookie.name == "session":
-                        session_cookie = cookie.value
-                        break
+        session_cookie = login_response.cookies.get("session")
+        if not session_cookie:
+            for cookie in login_response.cookies.jar:
+                if cookie.name == "session":
+                    session_cookie = cookie.value
+                    break
 
-            if session_cookie:
-                await r.setex(cache_key, 3300, session_cookie)  # 55 min TTL
-
-            return session_cookie or ""
+        if session_cookie:
+            await redis.setex(cache_key, 3300, session_cookie)  # 55 min TTL
+        return session_cookie or ""
