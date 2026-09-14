@@ -15,7 +15,7 @@ from app.models.project_lifecycle_job import (
     ProjectLifecycleJob,
 )
 from app.models.project_runtime_resource import ProjectRuntimeResource, RuntimeResourceKind
-from app.services.compose_provisioner import ComposeProvisioner, ObservedComposeResource
+from app.services.compose_provisioner import ComposeProvisioner, ObservedComposeResource, _json_list
 from app.services.lifecycle_queue import ClaimedJob, JobOwnershipError
 from app.services.project_database import ObservedDatabaseResource
 from app.services.runtime_artifacts import RuntimeArtifact, RuntimeArtifactWriter
@@ -105,6 +105,13 @@ class _ReadinessChecker:
 
     async def wait_ready(self, _deployment: ProjectDeployment) -> None:
         self.calls += 1
+
+
+def test_compose_resource_parser_accepts_compose_ndjson() -> None:
+    assert _json_list('{"Name":"first"}\n{"Name":"second"}\n') == [
+        {"Name": "first"},
+        {"Name": "second"},
+    ]
 
 
 class _FailsReadinessOnce(_ReadinessChecker):

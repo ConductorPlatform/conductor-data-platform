@@ -293,6 +293,7 @@ def test_airflow_init_uses_container_environment_not_compose_interpolated_creden
     assert "AIRFLOW__CORE__AUTH_MANAGER" in init_service
     assert "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager" in init_service
     assert "python /home/airflow/bootstrap_airflow_users.py" in init_service
+    assert "${AIRFLOW_IMAGE:-conductor-airflow:latest}" in template
 
 
 def test_canonical_airflow_image_includes_fab_and_resumable_cli_bootstrap() -> None:
@@ -303,6 +304,36 @@ def test_canonical_airflow_image_includes_fab_and_resumable_cli_bootstrap() -> N
     assert "bootstrap_airflow_users.py" in dockerfile
     assert '"users",\n            "create",' in bootstrap
     assert '"users", "list", "--output", "json"' in bootstrap
+
+
+def test_runtime_artifact_resolves_configured_airflow_image(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec
+) -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("Docker CLI is required for Compose semantic validation")
+
+    airflow_image = "registry.example.test/conductor-airflow:acceptance"
+    artifact = RuntimeArtifactWriter(runtime_root=tmp_path, airflow_image=airflow_image).render(runtime_spec)
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            str(artifact.env_path),
+            "-f",
+            str(artifact.compose_path),
+            "config",
+            "--format",
+            "json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    resolved = json.loads(result.stdout)
+    assert resolved["services"]["airflow-init"]["image"] == airflow_image
 
 
 def test_failed_second_artifact_write_never_publishes_a_partial_generation(

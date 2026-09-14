@@ -11,7 +11,7 @@ x-airflow-environment: &airflow-environment
     AIRFLOW__API__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080
 
 x-airflow-common: &airflow-common
-  image: conductor-airflow:latest
+  image: ${AIRFLOW_IMAGE:-conductor-airflow:latest}
   environment: *airflow-environment
   volumes:
     - dags:/opt/airflow/dags

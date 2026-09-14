@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -78,6 +79,7 @@ class SubprocessComposeClient:
             *arguments,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=os.environ | {"AIRFLOW_IMAGE": self._airflow_image},
         )
         stdout, stderr = await process.communicate()
         if process.returncode:
@@ -179,7 +181,7 @@ class HttpAirflowReadinessChecker:
         self._poll_seconds = poll_seconds
 
     async def wait_ready(self, deployment: ProjectDeployment) -> None:
-        url = f"http://{_internal_airflow_alias(deployment.project_id)}:8080/api/v1/login/"
+        base_url = f"http://{_internal_airflow_alias(deployment.project_id)}:8080"
         credentials = {
             "username": deployment.airflow_integration_user,
             "password": decrypt_token(deployment.airflow_integration_password_encrypted),
@@ -188,10 +190,15 @@ class HttpAirflowReadinessChecker:
         async with httpx.AsyncClient(timeout=min(self._poll_seconds, 10.0)) as client:
             while True:
                 try:
-                    response = await client.post(url, data=credentials)
-                    if response.status_code == 200 and response.cookies.get("session"):
+                    response = await client.post(f"{base_url}/auth/token", json=credentials)
+                    access_token = response.json().get("access_token") if response.is_success else None
+                    authenticated = await client.get(
+                        f"{base_url}/api/v2/dags",
+                        headers={"Authorization": f"Bearer {access_token}"},
+                    ) if access_token else None
+                    if authenticated is not None and authenticated.status_code == 200:
                         return
-                except httpx.HTTPError:
+                except (httpx.HTTPError, ValueError):
                     pass
                 if asyncio.get_running_loop().time() >= deadline:
                     raise TimeoutError("Airflow did not become authenticated-ready before timeout")
@@ -435,6 +442,7 @@ def build_compose_provisioner(
         artifact_writer=RuntimeArtifactWriter(
             runtime_root=runtime_root,
             runtime_ingress_network=runtime_ingress_network,
+            airflow_image=airflow_image,
             airflow_database_host=airflow_database_host,
             airflow_database_port=airflow_database_port,
         ),
@@ -496,8 +504,11 @@ def _internal_airflow_alias(project_id: str) -> str:
 def _json_list(output: str) -> list[dict[str, Any]]:
     try:
         decoded = json.loads(output)
-    except json.JSONDecodeError as error:
-        raise ForeignResourceConflictError("Docker inspection returned invalid JSON") from error
+    except json.JSONDecodeError:
+        try:
+            decoded = [json.loads(line) for line in output.splitlines() if line.strip()]
+        except json.JSONDecodeError as error:
+            raise ForeignResourceConflictError("Docker inspection returned invalid JSON") from error
     if isinstance(decoded, dict):
         return [decoded]
     if isinstance(decoded, list) and all(isinstance(item, dict) for item in decoded):
