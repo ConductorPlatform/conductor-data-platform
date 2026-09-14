@@ -31,6 +31,15 @@ TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "app/runtime_templates/v1/
 ENV_FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures/runtime-v1.env"
 
 
+def test_runtime_bundle_configuration_retains_git_metadata_for_versioned_checkouts() -> None:
+    template = TEMPLATE_PATH.read_text()
+
+    # Both the nested DAG resolver and the immutable artifact helper derive the
+    # run's checkout root and commit from its native .git metadata. Provider-git
+    # otherwise removes that directory after materializing version=<SHA>.
+    assert '"prune_dotgit_folder":false' in template
+
+
 @pytest.fixture
 def runtime_spec() -> RuntimeArtifactSpec:
     return RuntimeArtifactSpec(
