@@ -93,6 +93,24 @@ async def test_warehouse_creates_only_deterministic_owned_resources_and_private_
 
 
 @pytest.mark.asyncio
+async def test_warehouse_preserves_maintenance_dsn_query_when_connecting_to_project_database() -> None:
+    connection = _Connection()
+    connect = AsyncMock(return_value=connection)
+    manager = ProjectWarehouseManager(
+        "postgresql://operator@warehouse:5432/operator_db?sslmode=require&target_session_attrs=read-write",
+        connect=connect,
+        database_manager=cast(Any, _DatabaseManager()),
+    )
+
+    await manager.ensure_warehouse(cast(Any, deployment()))
+
+    connect.assert_awaited_once_with(
+        f"postgresql://operator@warehouse:5432/{WAREHOUSE_NAME}"
+        "?sslmode=require&target_session_attrs=read-write"
+    )
+
+
+@pytest.mark.asyncio
 async def test_warehouse_rejects_another_projects_identity_before_connecting() -> None:
     connect = AsyncMock()
     manager = ProjectWarehouseManager(
