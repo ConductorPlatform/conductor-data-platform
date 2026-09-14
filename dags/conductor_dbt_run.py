@@ -1,14 +1,9 @@
 """
 Conductor — example dbt DAG for Airflow 3.x.
 
-This DAG runs dbt models in production after a developer merges
-their feature branch to main. The dbt invocation uses the manifest
-generated during development.
-
-Requirements:
-  - dbt-core 2.0.0a4 installed on the worker
-  - A dbt project exists at /opt/airflow/dags/dbt_project/
-  - The dbt profiles.yml is configured for the target warehouse
+This DAG runs dbt models from the same immutable GitDagBundle version as
+the DAG itself. The Git connection supplies the production ref and safe
+repository-relative paths; no mutable IDE workspace is used.
 """
 
 from __future__ import annotations
@@ -17,9 +12,10 @@ from datetime import datetime
 
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.bash import BashOperator
+from conductor_git_bundle import dbt_project_dir
 
-DBT_PROJECT_DIR = "/opt/airflow/dags/dbt_project"
-DBT_PROFILES_DIR = "/opt/airflow/dags/dbt_project/profiles"
+DBT_PROJECT_DIR = dbt_project_dir(__file__)
+DBT_PROFILES_DIR = f"{DBT_PROJECT_DIR}/profiles"
 
 
 with DAG(

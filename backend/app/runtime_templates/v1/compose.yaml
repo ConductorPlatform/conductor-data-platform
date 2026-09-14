@@ -5,6 +5,8 @@ x-airflow-environment: &airflow-environment
     AIRFLOW__CORE__LOAD_EXAMPLES: "False"
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST: >-
+      [{"name":"conductor-git","classpath":"conductor_git_bundle.ConductorGitDagBundle","kwargs":{"git_conn_id":"conductor_git","refresh_interval":60}}]
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@${AIRFLOW_DATABASE_HOST}:${AIRFLOW_DATABASE_PORT}/${AIRFLOW_DB_NAME}
     AIRFLOW__CELERY__BROKER_URL: redis://project-redis:6379/0
     AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@${AIRFLOW_DATABASE_HOST}:${AIRFLOW_DATABASE_PORT}/${AIRFLOW_DB_NAME}

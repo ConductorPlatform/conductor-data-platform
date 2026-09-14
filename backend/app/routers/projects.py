@@ -20,6 +20,7 @@ from app.models.audit_event import AuditEvent
 from app.models.environment import Environment
 from app.models.git_config import GitConfig
 from app.models.project import Project, ProjectLifecycleStatus
+from app.models.project_deployment import ProjectDeployment
 from app.models.project_lifecycle_job import (
     LifecycleJobStatus,
     LifecycleOperation,
@@ -47,7 +48,9 @@ from app.schemas.settings import (
     ProjectSettingsUpdateRequest,
 )
 from app.services.crypto import CredentialsEncryptionNotConfigured, encrypt_token
+from app.services.git_dag_bundle import GitDagBundleSyncError, sync_git_dag_connection
 from app.services.project_access import load_ready_project_for_user
+from app.services.project_airflow_context import ProjectAirflowContext
 from app.services.project_operations import (
     DuplicateProjectSlugError,
     IdempotencyKeyConflictError,
@@ -791,8 +794,32 @@ async def update_git_config(
     if config.auth_type == "token" and not config.credentials_encrypted:
         raise HTTPException(status_code=422, detail="Token authentication requires a token")
 
-    await db.commit()
-    await db.refresh(config)
+    # Legacy unauthenticated/SSH configurations remain persisted, but only the
+    # token path is an MVP production bundle. Switching away from it revokes
+    # the deterministic connection without attempting to support another mode.
+    try:
+        if config.auth_type == "token" or previous_auth_type == "token":
+            deployment = (
+                await db.execute(select(ProjectDeployment).where(ProjectDeployment.project_id == project.id))
+            ).scalar_one_or_none()
+            if deployment is None:
+                raise HTTPException(status_code=404, detail="Airflow not provisioned")
+            await sync_git_dag_connection(
+                context=ProjectAirflowContext(
+                    project_id=project.id,
+                    deployment_id=deployment.id,
+                    deployment_generation=deployment.generation,
+                    airflow_base_url=f"http://airflow-{project.id}:8080",
+                    account_key="admin",
+                ),
+                config=config,
+                db=db,
+            )
+        await db.commit()
+        await db.refresh(config)
+    except GitDagBundleSyncError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=502, detail="Airflow Git connection update failed") from exc
 
     return GitConfigResponse(
         repo_url=config.repo_url,

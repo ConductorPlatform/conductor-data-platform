@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -49,6 +50,27 @@ class GitConfigUpdateRequest(BaseModel):
     def reject_blank_credentials(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("Credential must not be blank")
+        return value
+
+    @field_validator("dbt_path", "dags_path")
+    @classmethod
+    def require_canonical_repository_directory(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value or value in (".", "./") or "\\" in value or "\x00" in value or value.startswith("/"):
+            raise ValueError("Path must be a repository-relative POSIX directory")
+        path = PurePosixPath(value)
+        if any(part in ("", ".", "..") for part in path.parts):
+            raise ValueError("Path must be a repository-relative POSIX directory")
+        return str(path)
+
+    @field_validator("default_branch")
+    @classmethod
+    def reject_unsafe_git_ref(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value or value.startswith("-") or "\x00" in value or "\\" in value or ".." in value:
+            raise ValueError("Production branch is not a safe Git ref")
         return value
 
     @model_validator(mode="after")

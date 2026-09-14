@@ -23,6 +23,11 @@ def configure_credentials_encryption_key(monkeypatch):
         "test-only-credentials-encryption-key-1234567890",
     )
 
+    async def sync_git_connection(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("app.routers.projects.sync_git_dag_connection", sync_git_connection)
+
 
 async def _mark_project_ready(db_session: AsyncSession, project_id: str) -> None:
     project = await db_session.get(Project, project_id)
