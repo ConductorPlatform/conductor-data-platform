@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+from datetime import UTC, datetime
 from urllib.parse import urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth.deps import get_current_user
 from app.auth.permissions import require_super_admin
 from app.database import get_db_session
+from app.models.audit_event import AuditEvent
 from app.models.environment import Environment
 from app.models.git_config import GitConfig
 from app.models.project import Project, ProjectLifecycleStatus
+from app.models.project_lifecycle_job import (
+    LifecycleJobStatus,
+    LifecycleOperation,
+    ProjectLifecycleJob,
+)
 from app.models.project_member import ProjectMember
 from app.models.role import Role
 from app.models.user import User
@@ -23,6 +33,7 @@ from app.schemas.project import (
     ProjectCreateRequest,
     ProjectCreateResponse,
     ProjectOperationResponse,
+    ProjectOperationStatusResponse,
     ProjectResponse,
     ProjectUpdateRequest,
 )
@@ -45,6 +56,8 @@ from app.services.project_operations import (
 from app.services.secret_redaction import redact_secret_text
 
 router = APIRouter()
+
+_PROVISION_RETRY_MAX_ATTEMPTS = 5
 
 
 def _slugify(name: str) -> str:
@@ -173,6 +186,215 @@ async def create_project(
             status=operation.status,
         ),
     )
+
+
+def _operation_response(operation: ProjectLifecycleJob) -> ProjectOperationResponse:
+    return ProjectOperationResponse(
+        id=operation.id,
+        operation=operation.operation,
+        status=operation.status,
+    )
+
+
+def _operation_status_response(
+    project: Project,
+    operation: ProjectLifecycleJob,
+) -> ProjectOperationStatusResponse:
+    return ProjectOperationStatusResponse(
+        **_operation_response(operation).model_dump(),
+        project_status=project.lifecycle_status,
+        current_step=operation.current_step,
+        attempt=operation.attempt,
+        max_attempts=operation.max_attempts,
+        error_code=operation.error_code,
+        error_message=(
+            redact_secret_text(operation.error_message) if operation.error_message is not None else None
+        ),
+    )
+
+
+def _provision_retry_fingerprint(*, actor_id: str, project_id: str, failed_operation_id: str) -> str:
+    canonical_request = json.dumps(
+        {
+            "actor_id": actor_id,
+            "failed_operation_id": failed_operation_id,
+            "operation": "provision_retry",
+            "project_id": project_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_request.encode()).hexdigest()
+
+
+async def _load_project_operation(
+    db: AsyncSession,
+    *,
+    slug: str,
+    operation_id: str,
+    lock_project: bool = False,
+    lock_operation: bool = False,
+) -> tuple[Project, ProjectLifecycleJob]:
+    project_query = select(Project).where(Project.slug == slug)
+    if lock_project:
+        project_query = project_query.with_for_update()
+    project = (await db.execute(project_query)).scalar_one_or_none()
+    if project is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    operation_query = select(ProjectLifecycleJob).where(
+        ProjectLifecycleJob.id == operation_id,
+        ProjectLifecycleJob.project_id == project.id,
+    )
+    if lock_operation:
+        operation_query = operation_query.with_for_update()
+    operation = (await db.execute(operation_query)).scalar_one_or_none()
+    if operation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operation not found")
+    return project, operation
+
+
+@router.get(
+    "/projects/{slug}/operations/{operation_id}",
+    response_model=ProjectOperationStatusResponse,
+)
+async def get_project_operation(
+    slug: str,
+    operation_id: str,
+    _user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Return sanitized lifecycle progress only to the provision authority."""
+
+    project, operation = await _load_project_operation(
+        db,
+        slug=slug,
+        operation_id=operation_id,
+    )
+    return _operation_status_response(project, operation)
+
+
+@router.post(
+    "/projects/{slug}/operations/{operation_id}/retry",
+    response_model=ProjectOperationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_project_provision(
+    slug: str,
+    operation_id: str,
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
+    user: User = Depends(require_super_admin),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Atomically requeue one failed provision without reallocating its runtime identity."""
+
+    key = str(idempotency_key)
+    project: Project | None = None
+    fingerprint: str | None = None
+    try:
+        project, failed_operation = await _load_project_operation(
+            db,
+            slug=slug,
+            operation_id=operation_id,
+            lock_project=True,
+            lock_operation=True,
+        )
+        fingerprint = _provision_retry_fingerprint(
+            actor_id=user.id,
+            project_id=project.id,
+            failed_operation_id=failed_operation.id,
+        )
+        replay = (
+            await db.execute(
+                select(ProjectLifecycleJob).where(ProjectLifecycleJob.idempotency_key == key)
+            )
+        ).scalar_one_or_none()
+        if replay is not None:
+            if (
+                replay.project_id == project.id
+                and replay.operation is LifecycleOperation.PROVISION
+                and replay.requested_by == user.id
+                and replay.request_fingerprint == fingerprint
+            ):
+                response = _operation_response(replay)
+                await db.rollback()
+                return response
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency key already used with a different request",
+            )
+
+        if (
+            failed_operation.operation is not LifecycleOperation.PROVISION
+            or failed_operation.status is not LifecycleJobStatus.FAILED
+            or project.lifecycle_status is not ProjectLifecycleStatus.PROVISION_FAILED
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Only a failed project provision can be retried",
+            )
+
+        now = datetime.now(UTC)
+        retry = ProjectLifecycleJob(
+            project_id=project.id,
+            operation=LifecycleOperation.PROVISION,
+            status=LifecycleJobStatus.PENDING,
+            attempt=0,
+            max_attempts=failed_operation.max_attempts or _PROVISION_RETRY_MAX_ATTEMPTS,
+            available_at=now,
+            idempotency_key=key,
+            request_fingerprint=fingerprint,
+            requested_by=user.id,
+            correlation_id=uuid4().hex,
+        )
+        project.lifecycle_status = ProjectLifecycleStatus.PROVISIONING
+        db.add(retry)
+        await db.flush()
+        db.add(
+            AuditEvent(
+                event_type="project.provision.retry_requested",
+                actor_user_id=user.id,
+                project_id_snapshot=project.id,
+                project_name_snapshot=project.name,
+                project_slug_snapshot=project.slug,
+                correlation_id=retry.correlation_id,
+                outcome="requested",
+                metadata_json={
+                    "operation_id": retry.id,
+                    "retry_of_operation_id": failed_operation.id,
+                },
+            )
+        )
+        await db.commit()
+        return _operation_response(retry)
+    except HTTPException:
+        await db.rollback()
+        raise
+    except IntegrityError:
+        await db.rollback()
+        replay = (
+            await db.execute(
+                select(ProjectLifecycleJob).where(ProjectLifecycleJob.idempotency_key == key)
+            )
+        ).scalar_one_or_none()
+        if (
+            replay is not None
+            and project is not None
+            and replay.project_id == project.id
+            and replay.operation is LifecycleOperation.PROVISION
+            and replay.requested_by == user.id
+            and replay.request_fingerprint == fingerprint
+        ):
+            return _operation_response(replay)
+        if replay is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency key already used with a different request",
+            ) from None
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Project provision retry conflicts with another request",
+        ) from None
 
 
 @router.get("/projects/{slug}", response_model=ProjectResponse)

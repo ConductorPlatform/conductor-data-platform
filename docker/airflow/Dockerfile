@@ -11,9 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 USER airflow
 
-# ── dbt-core for Airflow worker ──
+# ── FAB auth manager + dbt-core for project runtimes ──
 RUN pip install --no-cache-dir \
+    "apache-airflow-providers-fab" \
     "dbt-core==2.0.0a4"
 
-# ── System user creation script ──
-COPY --chown=airflow:root create_airflow_users.py /home/airflow/
+# ── Idempotent project service-account bootstrap ──
+COPY --chown=airflow:root bootstrap_airflow_users.py /home/airflow/

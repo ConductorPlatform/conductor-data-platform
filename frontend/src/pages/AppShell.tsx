@@ -2,7 +2,7 @@ import { Link, useParams, useLocation, Outlet } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
 
 export default function AppShell() {
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
   const { slug } = useParams();
   const location = useLocation();
 

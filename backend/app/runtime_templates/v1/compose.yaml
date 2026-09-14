@@ -4,17 +4,20 @@ x-airflow-environment: &airflow-environment
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__LOAD_EXAMPLES: "False"
     AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@postgres:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@${AIRFLOW_DATABASE_HOST}:${AIRFLOW_DATABASE_PORT}/${AIRFLOW_DB_NAME}
     AIRFLOW__CELERY__BROKER_URL: redis://project-redis:6379/0
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@postgres:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB_ROLE}:${AIRFLOW_DB_PASSWORD_URLENCODED}@${AIRFLOW_DATABASE_HOST}:${AIRFLOW_DATABASE_PORT}/${AIRFLOW_DB_NAME}
     AIRFLOW__API__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080
 
 x-airflow-common: &airflow-common
-  image: conductor-airflow:latest
+  image: ${AIRFLOW_IMAGE:-conductor-airflow:latest}
   environment: *airflow-environment
   volumes:
     - dags:/opt/airflow/dags
     - logs:/opt/airflow/logs
+  extra_hosts:
+    - host.docker.internal:host-gateway
   depends_on:
     project-redis:
       condition: service_healthy
@@ -56,23 +59,21 @@ services:
       - -c
       - >-
         airflow db migrate &&
-        airflow users create --username "$$AIRFLOW_ADMIN_USER" --password "$$AIRFLOW_ADMIN_PASSWORD" --firstname Admin --lastname User --role Admin --email admin@conductor.local &&
-        airflow users create --username "$$AIRFLOW_DEV_USER" --password "$$AIRFLOW_DEV_PASSWORD" --firstname Developer --lastname User --role User --email dev@conductor.local &&
-        airflow users create --username "$$AIRFLOW_VIEWER_USER" --password "$$AIRFLOW_VIEWER_PASSWORD" --firstname Viewer --lastname User --role Viewer --email viewer@conductor.local &&
-        airflow users create --username "$$AIRFLOW_INTEGRATION_USER" --password "$$AIRFLOW_INTEGRATION_PASSWORD" --firstname Integration --lastname User --role Viewer --email integration@conductor.local
+        python /home/airflow/bootstrap_airflow_users.py
 
   airflow-api-server:
     <<: *airflow-common
     command: airflow api-server --apps all
+    networks:
+      default: {}
+      ingress:
+        aliases:
+          - ${AIRFLOW_INTERNAL_ALIAS}
     labels:
       - conductor.managed=true
       - conductor.project_id=${CONDUCTOR_PROJECT_ID}
       - conductor.template_version=${CONDUCTOR_TEMPLATE_VERSION}
-      - traefik.enable=true
-      - traefik.docker.network=${COMPOSE_PROJECT_NAME}_default
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-airflow.rule=Host(`${AIRFLOW_EXTERNAL_HOST}`) && (PathPrefix(`/api/`) || PathPrefix(`/auth/`))
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-airflow.entrypoints=websecure
-      - traefik.http.services.conductor-${CONDUCTOR_PROJECT_ID}-airflow.loadbalancer.server.port=8080
+      - traefik.enable=false
 
   airflow-scheduler:
     <<: *airflow-common
@@ -86,35 +87,16 @@ services:
     <<: *airflow-common
     command: airflow celery worker
 
-  workspace-session-manager:
-    image: conductor-workspace-session-manager:latest
-    environment:
-      CONDUCTOR_PROJECT_ID: ${CONDUCTOR_PROJECT_ID}
-      CONDUCTOR_PROJECT_SLUG: ${PROJECT_SLUG}
-    volumes:
-      - workspaces:/workspace
-      - ide-user-data:/ide-data
-    labels:
-      - conductor.managed=true
-      - conductor.project_id=${CONDUCTOR_PROJECT_ID}
-      - conductor.template_version=${CONDUCTOR_TEMPLATE_VERSION}
-      - traefik.enable=true
-      - traefik.docker.network=${COMPOSE_PROJECT_NAME}_default
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-ide.rule=Host(`${AIRFLOW_EXTERNAL_HOST}`) && PathPrefix(`/ide/${PROJECT_SLUG}/`)
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-ide.entrypoints=websecure
-      - traefik.http.routers.conductor-${CONDUCTOR_PROJECT_ID}-ide.middlewares=conductor-${CONDUCTOR_PROJECT_ID}-ide-auth
-      - traefik.http.middlewares.conductor-${CONDUCTOR_PROJECT_ID}-ide-auth.forwardauth.address=http://fastapi:8000/api/v1/internal/ide/authorize
-      - traefik.http.middlewares.conductor-${CONDUCTOR_PROJECT_ID}-ide-auth.forwardauth.trustForwardHeader=true
-      - traefik.http.services.conductor-${CONDUCTOR_PROJECT_ID}-ide.loadbalancer.server.port=8080
-
 networks:
   default:
     name: ${COMPOSE_PROJECT_NAME}_default
-    internal: true
     labels:
       conductor.managed: "true"
       conductor.project_id: ${CONDUCTOR_PROJECT_ID}
       conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
+  ingress:
+    name: ${CONDUCTOR_RUNTIME_INGRESS_NETWORK}
+    external: true
 
 volumes:
   dags:
@@ -123,16 +105,6 @@ volumes:
       conductor.project_id: ${CONDUCTOR_PROJECT_ID}
       conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
   logs:
-    labels:
-      conductor.managed: "true"
-      conductor.project_id: ${CONDUCTOR_PROJECT_ID}
-      conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
-  workspaces:
-    labels:
-      conductor.managed: "true"
-      conductor.project_id: ${CONDUCTOR_PROJECT_ID}
-      conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
-  ide-user-data:
     labels:
       conductor.managed: "true"
       conductor.project_id: ${CONDUCTOR_PROJECT_ID}

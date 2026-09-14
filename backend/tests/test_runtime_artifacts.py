@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import json
 import os
-from pathlib import Path
 import shutil
 import stat
 import subprocess
+from dataclasses import replace
+from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -17,10 +18,9 @@ from app.services.runtime_artifacts import (
     runtime_artifact_metadata,
 )
 
-
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 FIXTURE_SECRETS = (
-    "fixture-airflow-db-password",
+    "fixture-airflow-db-password:/?#[]!$&'()*+,;=%%",
     "fixture-airflow-admin-password",
     "fixture-airflow-dev-password",
     "fixture-airflow-viewer-password",
@@ -167,6 +167,51 @@ def test_runtime_env_serialization_preserves_compose_literals_and_uri_encodes_da
     assert "AIRFLOW_DB_PASSWORD=" not in rendered_env
 
 
+def test_runtime_artifacts_allow_a_trusted_task_specific_ingress_network(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec
+) -> None:
+    artifact = RuntimeArtifactWriter(
+        runtime_root=tmp_path,
+        runtime_ingress_network="conductor-t35719905-runtime-ingress",
+    ).render(runtime_spec)
+
+    assert "CONDUCTOR_RUNTIME_INGRESS_NETWORK='conductor-t35719905-runtime-ingress'" in artifact.env_path.read_text()
+
+
+def test_runtime_artifacts_allow_a_trusted_airflow_database_endpoint(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec
+) -> None:
+    artifact = RuntimeArtifactWriter(
+        runtime_root=tmp_path,
+        airflow_database_host="host.docker.internal",
+        airflow_database_port=15432,
+    ).render(runtime_spec)
+
+    rendered_env = artifact.env_path.read_text()
+    assert "AIRFLOW_DATABASE_HOST='host.docker.internal'" in rendered_env
+    assert "AIRFLOW_DATABASE_PORT='15432'" in rendered_env
+
+
+@pytest.mark.parametrize("host, port", [("bad/host", 5432), ("host.docker.internal", 0)])
+def test_runtime_artifacts_reject_unsafe_airflow_database_endpoints(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec, host: str, port: int
+) -> None:
+    with pytest.raises(ValueError, match="airflow_database_(host|port)"):
+        RuntimeArtifactWriter(
+            runtime_root=tmp_path,
+            airflow_database_host=host,
+            airflow_database_port=port,
+        ).render(runtime_spec)
+
+
+@pytest.mark.parametrize("network", ["", "CONDUCTOR-INGRESS", "network/name", "network space"])
+def test_runtime_artifacts_reject_unsafe_ingress_network_names(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec, network: str
+) -> None:
+    with pytest.raises(ValueError, match="canonical Docker network name"):
+        RuntimeArtifactWriter(runtime_root=tmp_path, runtime_ingress_network=network).render(runtime_spec)
+
+
 def test_template_uses_uri_encoded_database_password() -> None:
     template = TEMPLATE_PATH.read_text()
 
@@ -245,7 +290,51 @@ def test_airflow_init_uses_container_environment_not_compose_interpolated_creden
         "AIRFLOW_INTEGRATION_USER",
         "AIRFLOW_INTEGRATION_PASSWORD",
     ):
-        assert f'"$${variable}"' in init_service
+        assert f"{variable}: ${{{variable}}}" in init_service
+    assert "AIRFLOW__CORE__AUTH_MANAGER" in init_service
+    assert "airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager" in init_service
+    assert "python /home/airflow/bootstrap_airflow_users.py" in init_service
+    assert "${AIRFLOW_IMAGE:-conductor-airflow:latest}" in template
+
+
+def test_canonical_airflow_image_includes_fab_and_resumable_cli_bootstrap() -> None:
+    dockerfile = (TEMPLATE_PATH.parents[4] / "docker" / "airflow" / "Dockerfile").read_text()
+    bootstrap = (TEMPLATE_PATH.parents[4] / "docker" / "airflow" / "bootstrap_airflow_users.py").read_text()
+
+    assert '"apache-airflow-providers-fab"' in dockerfile
+    assert "bootstrap_airflow_users.py" in dockerfile
+    assert '"users",\n            "create",' in bootstrap
+    assert '"users", "list", "--output", "json"' in bootstrap
+
+
+def test_runtime_artifact_resolves_configured_airflow_image(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec
+) -> None:
+    if shutil.which("docker") is None:
+        pytest.skip("Docker CLI is required for Compose semantic validation")
+
+    airflow_image = "registry.example.test/conductor-airflow:acceptance"
+    artifact = RuntimeArtifactWriter(runtime_root=tmp_path, airflow_image=airflow_image).render(runtime_spec)
+    result = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            str(artifact.env_path),
+            "-f",
+            str(artifact.compose_path),
+            "config",
+            "--format",
+            "json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    resolved = json.loads(result.stdout)
+    assert resolved["services"]["airflow-init"]["image"] == airflow_image
 
 
 def test_failed_second_artifact_write_never_publishes_a_partial_generation(
@@ -345,14 +434,15 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
         "airflow-scheduler",
         "airflow-dag-processor",
         "airflow-worker",
-        "workspace-session-manager",
     }
     assert "postgres" not in config["services"]
     assert "traefik" not in config["services"]
-    assert set(config["volumes"]) == {"dags", "logs", "workspaces", "ide-user-data"}
-    assert set(config["networks"]) == {"default"}
+    assert set(config["volumes"]) == {"dags", "logs"}
+    assert set(config["networks"]) == {"default", "ingress"}
     assert config["networks"]["default"]["name"] == f"conductor-p-{PROJECT_ID}_default"
-    assert config["networks"]["default"]["internal"] is True
+    assert config["networks"]["default"].get("internal") is not True
+    assert config["networks"]["ingress"]["external"] is True
+    assert config["networks"]["ingress"]["name"] == "conductor-runtime-ingress"
 
     for resource in [*config["services"].values(), *config["volumes"].values(), config["networks"]["default"]]:
         labels = resource["labels"]
@@ -363,25 +453,27 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     for service in config["services"].values():
         assert "ports" not in service
 
-    api_labels = config["services"]["airflow-api-server"]["labels"]
-    api_rule = next(value for key, value in api_labels.items() if key.endswith("-airflow.rule"))
-    assert "PathPrefix(`/api/`)" in api_rule
-    assert "PathPrefix(`/auth/`)" in api_rule
-    assert "PathPrefix(`/`)" not in api_rule
+    api_service = config["services"]["airflow-api-server"]
+    assert api_service["labels"]["traefik.enable"] == "false"
+    assert api_service["networks"]["ingress"]["aliases"] == [f"airflow-{PROJECT_ID}"]
 
     init_service = config["services"]["airflow-init"]
+    assert init_service["extra_hosts"] in (
+        ["host.docker.internal:host-gateway"],
+        ["host.docker.internal=host-gateway"],
+    )
     init_command = " ".join(init_service["command"])
     for secret in FIXTURE_SECRETS[1:]:
         assert secret not in init_command
-    assert '"$$AIRFLOW_ADMIN_PASSWORD"' in init_command
-    assert init_service["environment"]["AIRFLOW__CELERY__RESULT_BACKEND"].endswith(
-        f":{FIXTURE_SECRETS[0]}@postgres:5432/conductor_airflow_{PROJECT_ID}"
+    assert "python /home/airflow/bootstrap_airflow_users.py" in init_command
+    result_backend = init_service["environment"]["AIRFLOW__CELERY__RESULT_BACKEND"]
+    assert result_backend == (
+        f"db+postgresql://conductor_airflow_{PROJECT_ID}:"
+        f"{quote(FIXTURE_SECRETS[0], safe='')}@host.docker.internal:5432/"
+        f"conductor_airflow_{PROJECT_ID}"
     )
 
-    manager_labels = config["services"]["workspace-session-manager"]["labels"]
-    ide_rule = next(value for key, value in manager_labels.items() if key.endswith("-ide.rule"))
-    assert ide_rule == "Host(`analytics.airflow.example.test`) && PathPrefix(`/ide/analytics/`)"
-    assert any(key.endswith("forwardauth.address") for key in manager_labels)
+    assert "workspace-session-manager" not in config["services"]
 
 
 def test_template_labels_and_non_secret_artifact_outputs_never_leak_fixture_secrets(

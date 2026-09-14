@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
-import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
@@ -17,7 +17,10 @@ from app.models.base import Base
 from app.models.role import Role
 from app.models.user import User
 
-TEST_DATABASE_URL = "postgresql+asyncpg://conductor:conductor@postgres:5432/conductor_test"
+TEST_DATABASE_URL = os.environ.get(
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://conductor:conductor@postgres:5432/conductor_test",
+)
 
 DEFAULT_ROLES = (
     ("super_admin", "Full access"),
