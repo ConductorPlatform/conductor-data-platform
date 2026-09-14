@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
@@ -259,6 +260,11 @@ async def test_access_token_uses_airflow_token_endpoint_and_caches_its_bearer_va
         (201, {}),
         (201, {"access_token": ""}),
         (201, {"access_token": 42}),
+        (201, None),
+        (201, []),
+        (201, "airflow-access-token"),
+        (201, 42),
+        (201, ValueError("invalid JSON")),
     ],
 )
 async def test_access_token_rejects_unsuccessful_or_invalid_token_response(
@@ -277,6 +283,8 @@ async def test_access_token_rejects_unsuccessful_or_invalid_token_response(
             self.status_code = response_status_code
 
         def json(self):
+            if isinstance(payload, ValueError):
+                raise payload
             return payload
 
     class TokenClient:
@@ -436,7 +444,7 @@ async def test_airflow_stats_uses_all_dags_dag_runs_route(monkeypatch):
         airflow_base_url="http://airflow-project-a:8080",
         account_key="dev",
     )
-    calls = []
+    requests: list[httpx.Request] = []
     payloads = [
         {"dags": [{"is_paused": False}, {"is_paused": True}]},
         {"total_entries": 3},
@@ -456,30 +464,17 @@ async def test_airflow_stats_uses_all_dags_dag_runs_route(monkeypatch):
         def now(cls, _timezone):
             return datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC)
 
-    class Response:
-        status_code = 200
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=payloads[len(requests) - 1])
 
-        def __init__(self, payload):
-            self.payload = payload
-
-        def json(self):
-            return self.payload
-
-    class Client:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return False
-
-        async def get(self, url, **kwargs):
-            calls.append((url, kwargs))
-            return Response(payloads[len(calls) - 1])
+    def client_factory() -> AsyncClient:
+        return AsyncClient(transport=httpx.MockTransport(handler))
 
     monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
     monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", get_access_token)
     monkeypatch.setattr(widgets, "datetime", FrozenDateTime)
-    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", client_factory)
 
     stats = await widgets.get_airflow_stats(
         "project-a", cast(User, SimpleNamespace(id="user-a")), object()
@@ -493,28 +488,46 @@ async def test_airflow_stats_uses_all_dags_dag_runs_route(monkeypatch):
         "runs_today": 8,
         "failed_24h": 1,
     }
-    assert calls == [
-        (
-            "http://airflow-project-a:8080/api/v2/dags",
-            {"headers": {"Authorization": "Bearer airflow-access-token"}},
-        ),
-        (
-            "http://airflow-project-a:8080/api/v2/dags/~/dagRuns?state=running&limit=100",
-            {"headers": {"Authorization": "Bearer airflow-access-token"}},
-        ),
-        (
-            "http://airflow-project-a:8080/api/v2/dags/~/dagRuns?state=queued&limit=100",
-            {"headers": {"Authorization": "Bearer airflow-access-token"}},
-        ),
-        (
-            "http://airflow-project-a:8080/api/v2/dags/~/dagRuns?start_date_gte=2026-02-03T00:00:00+00:00&limit=200",
-            {"headers": {"Authorization": "Bearer airflow-access-token"}},
-        ),
-        (
-            "http://airflow-project-a:8080/api/v2/dags/~/dagRuns?start_date_gte=2026-02-02T04:05:06+00:00&state=failed&limit=100",
-            {"headers": {"Authorization": "Bearer airflow-access-token"}},
-        ),
+    assert [request.url.path for request in requests] == [
+        "/api/v2/dags",
+        "/api/v2/dags/~/dagRuns",
+        "/api/v2/dags/~/dagRuns",
+        "/api/v2/dags/~/dagRuns",
+        "/api/v2/dags/~/dagRuns",
     ]
+    assert [dict(request.url.params) for request in requests[1:]] == [
+        {"state": "running", "limit": "100"},
+        {"state": "queued", "limit": "100"},
+        {"start_date_gte": "2026-02-03T00:00:00+00:00", "limit": "200"},
+        {
+            "start_date_gte": "2026-02-02T04:05:06+00:00",
+            "state": "failed",
+            "limit": "100",
+        },
+    ]
+    assert all(request.headers["Authorization"] == "Bearer airflow-access-token" for request in requests)
+    for request in requests[3:]:
+        query = request.url.query.decode()
+        assert "%2B00%3A00" in query
+        assert "+00:00" not in query
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, content=b"not-json"),
+        httpx.Response(200, json=None),
+        httpx.Response(200, json=[]),
+        httpx.Response(200, json="not-an-object"),
+        httpx.Response(200, json=42),
+    ],
+)
+def test_airflow_response_data_rejects_malformed_or_non_object_success_response(response):
+    with pytest.raises(HTTPException) as error:
+        widgets._airflow_response_data(response)
+
+    assert error.value.status_code == 502
+    assert error.value.detail == "Airflow API error"
 
 
 @pytest.mark.asyncio

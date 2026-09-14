@@ -21,7 +21,13 @@ def _airflow_response_data(response: httpx.Response) -> dict:
     """Return successful Airflow JSON under the established upstream-error contract."""
     if not 200 <= response.status_code < 300:
         raise HTTPException(status_code=502, detail="Airflow API error")
-    return response.json()
+    try:
+        data = response.json()
+    except ValueError as error:
+        raise HTTPException(status_code=502, detail="Airflow API error") from error
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=502, detail="Airflow API error")
+    return data
 
 
 @router.get("/projects/{slug}/airflow/dags", response_model=list[DAGSummary])
@@ -99,10 +105,19 @@ async def get_airflow_stats(
         active = sum(1 for dag in dags_data.get("dags", []) if not dag.get("is_paused", False))
         paused = sum(1 for dag in dags_data.get("dags", []) if dag.get("is_paused", False))
 
-        running_resp = await client.get(f"{base}/dags/~/dagRuns?state=running&limit=100", headers=headers)
+        dag_runs_url = f"{base}/dags/~/dagRuns"
+        running_resp = await client.get(
+            dag_runs_url,
+            headers=headers,
+            params={"state": "running", "limit": 100},
+        )
         running = _airflow_response_data(running_resp).get("total_entries", 0)
 
-        queued_resp = await client.get(f"{base}/dags/~/dagRuns?state=queued&limit=100", headers=headers)
+        queued_resp = await client.get(
+            dag_runs_url,
+            headers=headers,
+            params={"state": "queued", "limit": 100},
+        )
         queued = _airflow_response_data(queued_resp).get("total_entries", 0)
 
         today = (
@@ -111,14 +126,17 @@ async def get_airflow_stats(
             .isoformat()
         )
         today_resp = await client.get(
-            f"{base}/dags/~/dagRuns?start_date_gte={today}&limit=200", headers=headers
+            dag_runs_url,
+            headers=headers,
+            params={"start_date_gte": today, "limit": 200},
         )
         runs_today = _airflow_response_data(today_resp).get("total_entries", 0)
 
         last_24h = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
         failed_resp = await client.get(
-            f"{base}/dags/~/dagRuns?start_date_gte={last_24h}&state=failed&limit=100",
+            dag_runs_url,
             headers=headers,
+            params={"start_date_gte": last_24h, "state": "failed", "limit": 100},
         )
         failed_24h = _airflow_response_data(failed_resp).get("total_entries", 0)
 

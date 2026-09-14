@@ -65,9 +65,13 @@ class AirflowSessionManager:
             raise HTTPException(status_code=502, detail="Airflow authentication failed")
 
         try:
-            access_token = token_response.json().get("access_token")
+            token_data = token_response.json()
         except ValueError as error:
             raise HTTPException(status_code=502, detail="Airflow authentication failed") from error
+        if not isinstance(token_data, dict):
+            raise HTTPException(status_code=502, detail="Airflow authentication failed")
+
+        access_token = token_data.get("access_token")
         if not isinstance(access_token, str) or not access_token:
             raise HTTPException(status_code=502, detail="Airflow authentication failed")
 
