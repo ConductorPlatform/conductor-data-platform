@@ -176,7 +176,7 @@ describe('ProjectListPage', () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        '/api/v1/admin/projects/failed-project/operations/operation-1/retry',
+        '/api/v1/projects/failed-project/operations/operation-1/retry',
         expect.objectContaining({
           method: 'POST',
           headers: expect.objectContaining({ 'Idempotency-Key': '22222222-2222-4222-8222-222222222222' }),

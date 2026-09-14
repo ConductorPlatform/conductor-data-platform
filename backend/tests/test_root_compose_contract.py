@@ -14,6 +14,8 @@ def test_root_compose_uses_one_worker_managed_airflow_runtime_path() -> None:
     assert "airflow-image-build" in compose
     assert "lifecycle-worker:" in compose
     assert 'CONDUCTOR_AIRFLOW_PROXY_COOKIE_SECURE: "false"' in compose
+    assert "${CONDUCTOR_RUNTIME_INGRESS_NETWORK:-conductor-runtime-ingress}" in compose
+    assert "${CONDUCTOR_LIFECYCLE_AIRFLOW_IMAGE:-conductor-airflow:latest}" in compose
     assert "path: ./backend/.env" in compose
     assert "required: false" in compose
     for legacy_service in (

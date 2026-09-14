@@ -424,12 +424,21 @@ def build_compose_provisioner(
     runtime_root: Path,
     readiness_timeout_seconds: float,
     readiness_poll_seconds: float,
+    runtime_ingress_network: str = "conductor-runtime-ingress",
+    airflow_image: str = "conductor-airflow:latest",
+    airflow_database_host: str = "host.docker.internal",
+    airflow_database_port: int = 5432,
 ) -> ComposeProvisioner:
     return ComposeProvisioner(
         session_factory,
         database_manager=database_manager,
-        artifact_writer=RuntimeArtifactWriter(runtime_root=runtime_root),
-        compose_client=SubprocessComposeClient(),
+        artifact_writer=RuntimeArtifactWriter(
+            runtime_root=runtime_root,
+            runtime_ingress_network=runtime_ingress_network,
+            airflow_database_host=airflow_database_host,
+            airflow_database_port=airflow_database_port,
+        ),
+        compose_client=SubprocessComposeClient(airflow_image=airflow_image),
         readiness_checker=HttpAirflowReadinessChecker(
             timeout_seconds=readiness_timeout_seconds,
             poll_seconds=readiness_poll_seconds,

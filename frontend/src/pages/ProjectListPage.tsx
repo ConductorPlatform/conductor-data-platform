@@ -283,7 +283,7 @@ export default function ProjectListPage() {
       const refreshed = await Promise.all(activeOperations.map(async (operation) => {
         try {
           const response = await apiFetch(
-            `/admin/projects/${operation.projectSlug}/operations/${operation.operationId}`,
+            `/projects/${operation.projectSlug}/operations/${operation.operationId}`,
           ) as OperationResponse;
           return {
             ...operation,
@@ -319,7 +319,7 @@ export default function ProjectListPage() {
     const retryKey = crypto.randomUUID();
     try {
       const response = await apiFetch(
-        `/admin/projects/${operation.projectSlug}/operations/${operation.operationId}/retry`,
+        `/projects/${operation.projectSlug}/operations/${operation.operationId}/retry`,
         { method: 'POST', headers: { 'Idempotency-Key': retryKey } },
       ) as Pick<OperationResponse, 'id' | 'operation' | 'status'>;
       setOperations(replaceStoredOperation({

@@ -107,6 +107,7 @@ services:
         postgresql+asyncpg://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/${CONDUCTOR_DB_NAME:-conductor}
       CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY: ${CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY:?Set CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY to a stable Fernet key}
       CONDUCTOR_LIFECYCLE_RUNTIME_ROOT: /var/lib/conductor/runtimes
+      CONDUCTOR_LIFECYCLE_AIRFLOW_IMAGE: ${CONDUCTOR_LIFECYCLE_AIRFLOW_IMAGE:-conductor-airflow:latest}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./runtime:/var/lib/conductor/runtimes
@@ -170,7 +171,7 @@ networks:
   frontend_backend:
     driver: bridge
   runtime_ingress:
-    name: conductor-runtime-ingress
+    name: ${CONDUCTOR_RUNTIME_INGRESS_NETWORK:-conductor-runtime-ingress}
 
 volumes:
   postgres_data:

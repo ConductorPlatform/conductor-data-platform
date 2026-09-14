@@ -166,6 +166,51 @@ def test_runtime_env_serialization_preserves_compose_literals_and_uri_encodes_da
     assert "AIRFLOW_DB_PASSWORD=" not in rendered_env
 
 
+def test_runtime_artifacts_allow_a_trusted_task_specific_ingress_network(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec
+) -> None:
+    artifact = RuntimeArtifactWriter(
+        runtime_root=tmp_path,
+        runtime_ingress_network="conductor-t35719905-runtime-ingress",
+    ).render(runtime_spec)
+
+    assert "CONDUCTOR_RUNTIME_INGRESS_NETWORK='conductor-t35719905-runtime-ingress'" in artifact.env_path.read_text()
+
+
+def test_runtime_artifacts_allow_a_trusted_airflow_database_endpoint(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec
+) -> None:
+    artifact = RuntimeArtifactWriter(
+        runtime_root=tmp_path,
+        airflow_database_host="host.docker.internal",
+        airflow_database_port=15432,
+    ).render(runtime_spec)
+
+    rendered_env = artifact.env_path.read_text()
+    assert "AIRFLOW_DATABASE_HOST='host.docker.internal'" in rendered_env
+    assert "AIRFLOW_DATABASE_PORT='15432'" in rendered_env
+
+
+@pytest.mark.parametrize("host, port", [("bad/host", 5432), ("host.docker.internal", 0)])
+def test_runtime_artifacts_reject_unsafe_airflow_database_endpoints(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec, host: str, port: int
+) -> None:
+    with pytest.raises(ValueError, match="airflow_database_(host|port)"):
+        RuntimeArtifactWriter(
+            runtime_root=tmp_path,
+            airflow_database_host=host,
+            airflow_database_port=port,
+        ).render(runtime_spec)
+
+
+@pytest.mark.parametrize("network", ["", "CONDUCTOR-INGRESS", "network/name", "network space"])
+def test_runtime_artifacts_reject_unsafe_ingress_network_names(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec, network: str
+) -> None:
+    with pytest.raises(ValueError, match="canonical Docker network name"):
+        RuntimeArtifactWriter(runtime_root=tmp_path, runtime_ingress_network=network).render(runtime_spec)
+
+
 def test_template_uses_uri_encoded_database_password() -> None:
     template = TEMPLATE_PATH.read_text()
 
@@ -389,9 +434,9 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     for secret in FIXTURE_SECRETS[1:]:
         assert secret not in init_command
     assert "python /home/airflow/bootstrap_airflow_users.py" in init_command
-    assert init_service["environment"]["AIRFLOW__CELERY__RESULT_BACKEND"].endswith(
-        f":{FIXTURE_SECRETS[0]}@host.docker.internal:5432/conductor_airflow_{PROJECT_ID}"
-    )
+    result_backend = init_service["environment"]["AIRFLOW__CELERY__RESULT_BACKEND"]
+    assert result_backend.startswith(f"db+postgresql://conductor_airflow_{PROJECT_ID}:")
+    assert result_backend.endswith(f"@host.docker.internal:5432/conductor_airflow_{PROJECT_ID}")
 
     assert "workspace-session-manager" not in config["services"]
 

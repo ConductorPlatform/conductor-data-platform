@@ -51,6 +51,10 @@ def build_default_registry() -> LifecycleRunnerRegistry:
         async_session_factory,
         database_manager=AsyncpgProjectDatabaseManager(maintenance_dsn),
         runtime_root=settings.lifecycle_runtime_root,
+        runtime_ingress_network=settings.lifecycle_runtime_ingress_network,
+        airflow_image=settings.lifecycle_airflow_image,
+        airflow_database_host=settings.lifecycle_airflow_database_host,
+        airflow_database_port=settings.lifecycle_airflow_database_port,
         readiness_timeout_seconds=settings.lifecycle_airflow_ready_timeout_seconds,
         readiness_poll_seconds=settings.lifecycle_airflow_ready_poll_seconds,
     )
