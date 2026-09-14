@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import PipelinePage from '../../pages/PipelinePage';
 
@@ -36,16 +36,16 @@ const mockRuns = [
 
 describe('PipelinePage', () => {
   beforeAll(() => {
-    window.fetch = vi.fn((url: string) => {
-      const urlStr = String(url);
+    window.fetch = vi.fn((input: RequestInfo | URL) => {
+      const urlStr = String(input);
       if (urlStr.includes('/stats')) {
-        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockStats) });
+        return Promise.resolve(Response.json(mockStats));
       }
       if (urlStr.includes('/runs')) {
-        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockRuns) });
+        return Promise.resolve(Response.json(mockRuns));
       }
-      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockDags) });
-    });
+      return Promise.resolve(Response.json(mockDags));
+    }) as typeof fetch;
   });
 
   afterAll(() => {
@@ -113,7 +113,13 @@ describe('PipelinePage', () => {
     });
   });
 
-  it('shows "Open in Airflow" link', async () => {
+  it('bootstraps a scoped proxy session before opening Airflow', async () => {
+    const popup = {
+      opener: window,
+      location: { replace: vi.fn() },
+      close: vi.fn(),
+    } as unknown as Window;
+    const open = vi.spyOn(window, 'open').mockImplementation(() => popup);
     render(
       <MemoryRouter initialEntries={['/projects/test/pipeline']}>
         <Routes>
@@ -121,10 +127,39 @@ describe('PipelinePage', () => {
         </Routes>
       </MemoryRouter>
     );
+    fireEvent.click(await screen.findByRole('button', { name: /Open in Airflow/ }));
+
     await waitFor(() => {
-      const link = screen.getByText(/Open in Airflow/);
-      expect(link).toBeInTheDocument();
-      expect(link).toHaveAttribute('target', '_blank');
+      expect(window.fetch).toHaveBeenCalledWith(
+        '/api/v1/projects/test/airflow-proxy/bootstrap',
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(open).toHaveBeenCalledWith('about:blank', '_blank');
+      expect(popup.opener).toBeNull();
+      expect(popup.location.replace).toHaveBeenCalledWith('/api/v1/projects/test/airflow-proxy/');
+    });
+    open.mockRestore();
+  });
+
+  it('bootstraps before assigning the embedded Airflow proxy URL', async () => {
+    render(
+      <MemoryRouter initialEntries={['/projects/test/pipeline']}>
+        <Routes>
+          <Route path="/projects/:slug/pipeline" element={<PipelinePage />} />
+        </Routes>
+      </MemoryRouter>
+    );
+    fireEvent.click(await screen.findByText('etl_main'));
+
+    await waitFor(() => {
+      expect(window.fetch).toHaveBeenCalledWith(
+        '/api/v1/projects/test/airflow-proxy/bootstrap',
+        expect.objectContaining({ method: 'POST' }),
+      );
+      expect(document.querySelector('iframe')).toHaveAttribute(
+        'src',
+        '/api/v1/projects/test/airflow-proxy/dags/etl_main',
+      );
     });
   });
 });

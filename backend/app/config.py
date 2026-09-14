@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -28,16 +30,24 @@ class Settings(BaseSettings):
     reauth_rate_limit_attempts: int = 5
     reauth_rate_limit_window_seconds: int = 300
     trusted_proxy_cidrs: str = "127.0.0.0/8,::1/128"
+    airflow_proxy_session_ttl_seconds: int = Field(default=300, gt=0)
+    airflow_proxy_cookie_secure: bool = True
 
     # ── Durable lifecycle worker ──
     lifecycle_worker_poll_seconds: float = Field(default=1.0, gt=0, allow_inf_nan=False)
     lifecycle_worker_lease_seconds: int = Field(default=30, gt=0)
-    lifecycle_worker_heartbeat_seconds: float = Field(
-        default=10.0, gt=0, allow_inf_nan=False
-    )
+    lifecycle_worker_heartbeat_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
     lifecycle_retry_base_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     lifecycle_retry_cap_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     lifecycle_retry_jitter_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
+    lifecycle_runtime_root: Path = Path("/var/lib/conductor/runtimes")
+    lifecycle_runtime_ingress_network: str = "conductor-runtime-ingress"
+    lifecycle_airflow_image: str = "conductor-airflow:latest"
+    lifecycle_airflow_database_host: str = "host.docker.internal"
+    lifecycle_airflow_database_port: int = Field(default=5432, ge=1, le=65535)
+    lifecycle_maintenance_database_dsn: str | None = None
+    lifecycle_airflow_ready_timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
+    lifecycle_airflow_ready_poll_seconds: float = Field(default=2.0, gt=0, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_lifecycle_worker_timing(self) -> Settings:
@@ -45,6 +55,8 @@ class Settings(BaseSettings):
             raise ValueError("Lifecycle worker heartbeat must be shorter than its lease")
         if self.lifecycle_retry_base_seconds > self.lifecycle_retry_cap_seconds:
             raise ValueError("Lifecycle retry base must not exceed its cap")
+        if self.lifecycle_airflow_ready_poll_seconds > self.lifecycle_airflow_ready_timeout_seconds:
+            raise ValueError("Lifecycle readiness poll interval must not exceed its timeout")
         return self
 
     # ── Seed admin ──

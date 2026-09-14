@@ -12,11 +12,9 @@ from app.models.user import User
 security = HTTPBearer()
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: AsyncSession = Depends(get_db_session),
-) -> User:
-    payload = decode_token(credentials.credentials)
+async def get_current_user_from_access_token(token: str, db: AsyncSession) -> User:
+    """Load an active user from a signed access token."""
+    payload = decode_token(token)
     if payload is None or payload.get("type") != "access":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -30,3 +28,10 @@ async def get_current_user(
             detail="User not found or inactive",
         )
     return user
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: AsyncSession = Depends(get_db_session),
+) -> User:
+    return await get_current_user_from_access_token(credentials.credentials, db)

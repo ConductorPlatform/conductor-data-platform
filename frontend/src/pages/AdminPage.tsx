@@ -19,6 +19,7 @@ interface Project {
   slug: string;
   member_count: number;
   airflow_status: string;
+  lifecycle_status?: string;
   created_at: string;
 }
 
@@ -56,6 +57,9 @@ const PERMISSION_SCOPES = [
 function statusBadge(status: string) {
   const colors: Record<string, string> = {
     running: 'bg-green-900 text-green-400',
+    ready: 'bg-green-900 text-green-400',
+    provisioning: 'bg-yellow-900 text-yellow-400',
+    provision_failed: 'bg-red-900 text-red-400',
     not_provisioned: 'bg-gray-800 text-gray-400',
     stopped: 'bg-red-900 text-red-400',
     failed: 'bg-red-900 text-red-400',
@@ -72,7 +76,6 @@ function statusBadge(status: string) {
 
 function UsersTable() {
   const [users, setUsers] = useState<User[]>([]);
-  const [editingId, setEditingId] = useState<string | null>(null);
 
   useEffect(() => {
     apiFetch('/admin/users').then(setUsers).catch(() => setUsers([]));
@@ -163,6 +166,7 @@ function ProjectsTable() {
               <th className="text-left p-3 text-gray-400 font-medium">Name</th>
               <th className="text-left p-3 text-gray-400 font-medium">Slug</th>
               <th className="text-left p-3 text-gray-400 font-medium">Members</th>
+              <th className="text-left p-3 text-gray-400 font-medium">Lifecycle</th>
               <th className="text-left p-3 text-gray-400 font-medium">Airflow</th>
             </tr>
           </thead>
@@ -172,6 +176,7 @@ function ProjectsTable() {
                 <td className="p-3 text-white">{p.name}</td>
                 <td className="p-3 font-mono text-xs text-gray-400">{p.slug}</td>
                 <td className="p-3 text-gray-400">{p.member_count}</td>
+                <td className="p-3">{statusBadge(p.lifecycle_status || 'unknown')}</td>
                 <td className="p-3">{statusBadge(p.airflow_status)}</td>
               </tr>
             ))}

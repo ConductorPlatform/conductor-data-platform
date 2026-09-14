@@ -46,6 +46,7 @@ export default function PipelinePage() {
   const [tab, setTab] = useState('overview');
   const [selectedDag, setSelectedDag] = useState<string | null>(null);
   const [dagRunsLoading, setDagRunsLoading] = useState(false);
+  const [iframePath, setIframePath] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -72,9 +73,31 @@ export default function PipelinePage() {
     }
   };
 
-  const handleSelectDag = (dagId: string) => {
+  const bootstrapAirflowProxy = () => apiFetch(`/projects/${slug}/airflow-proxy/bootstrap`, {
+    method: 'POST',
+  });
+
+  const proxyPath = (path: string) => `/api/v1/projects/${slug}/airflow-proxy/${path}`;
+
+  const handleSelectDag = async (dagId: string) => {
     setSelectedDag(dagId);
+    setIframePath(null);
     fetchDagRuns(dagId);
+    try {
+      await bootstrapAirflowProxy();
+      setIframePath(proxyPath(`dags/${dagId}`));
+    } catch {
+      setIframePath(null);
+    }
+  };
+
+  const handleOpenAirflow = () => {
+    const popup = window.open('about:blank', '_blank');
+    if (!popup) return;
+    popup.opener = null;
+    bootstrapAirflowProxy()
+      .then(() => popup.location.replace(proxyPath('')))
+      .catch(() => popup.close());
   };
 
   const runStateColor = (state: string) => {
@@ -112,14 +135,13 @@ export default function PipelinePage() {
         active={tab}
         onChange={setTab}
         rightAction={
-          <a
-            href={`/api/v1/projects/${slug}/airflow-iframe/`}
-            target="_blank"
-            rel="noopener noreferrer"
+          <button
+            type="button"
+            onClick={handleOpenAirflow}
             className="text-xs text-[#818cf8] hover:underline"
           >
-            Open in Airflow (DW) ↗
-          </a>
+            Open in Airflow ↗
+          </button>
         }
       />
 
@@ -222,11 +244,13 @@ export default function PipelinePage() {
             className="bg-[#1a1b23] border border-[#2a2b36] rounded-lg overflow-hidden"
             style={{ height: '400px' }}
           >
-            <iframe
-              src={`/api/v1/projects/${slug}/airflow-iframe/dags/${selectedDag}`}
-              className="w-full h-full border-none"
-              sandbox="allow-scripts allow-same-origin"
-            />
+            {iframePath && (
+              <iframe
+                src={iframePath}
+                className="w-full h-full border-none"
+                sandbox="allow-scripts allow-same-origin"
+              />
+            )}
           </div>
         </div>
       )}
