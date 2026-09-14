@@ -24,11 +24,11 @@ async def list_dags(
     db: AsyncSession = Depends(get_db_session),
 ):
     context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
-    session = await AirflowSessionManager().get_session(context, db)
+    access_token = await AirflowSessionManager().get_access_token(context, db)
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{context.airflow_base_url}/api/v1/dags",
-            cookies={"session": session},
+            f"{context.airflow_base_url}/api/v2/dags",
+            headers={"Authorization": f"Bearer {access_token}"},
         )
     if resp.status_code != 200:
         raise HTTPException(502, "Airflow API error")
@@ -55,11 +55,11 @@ async def list_dag_runs(
     db: AsyncSession = Depends(get_db_session),
 ):
     context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
-    session = await AirflowSessionManager().get_session(context, db)
+    access_token = await AirflowSessionManager().get_access_token(context, db)
     async with httpx.AsyncClient() as client:
         resp = await client.get(
-            f"{context.airflow_base_url}/api/v1/dags/{dag_id}/dagRuns",
-            cookies={"session": session},
+            f"{context.airflow_base_url}/api/v2/dags/{dag_id}/dagRuns",
+            headers={"Authorization": f"Bearer {access_token}"},
         )
     if resp.status_code != 200:
         raise HTTPException(502, "Airflow API error")
@@ -85,23 +85,23 @@ async def get_airflow_stats(
 ):
     """Aggregate DAG statistics from Airflow REST API."""
     context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
-    session = await AirflowSessionManager().get_session(context, db)
+    access_token = await AirflowSessionManager().get_access_token(context, db)
 
     async with httpx.AsyncClient() as client:
-        cookies = {"session": session}
-        base = f"{context.airflow_base_url}/api/v1"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        base = f"{context.airflow_base_url}/api/v2"
 
-        dags_resp = await client.get(f"{base}/dags", cookies=cookies)
+        dags_resp = await client.get(f"{base}/dags", headers=headers)
         dags_data = dags_resp.json() if dags_resp.status_code == 200 else {}
         active = sum(1 for dag in dags_data.get("dags", []) if not dag.get("is_paused", False))
         paused = sum(1 for dag in dags_data.get("dags", []) if dag.get("is_paused", False))
 
-        running_resp = await client.get(f"{base}/dagRuns?state=running&limit=100", cookies=cookies)
+        running_resp = await client.get(f"{base}/dagRuns?state=running&limit=100", headers=headers)
         running = (
             running_resp.json().get("total_entries", 0) if running_resp.status_code == 200 else 0
         )
 
-        queued_resp = await client.get(f"{base}/dagRuns?state=queued&limit=100", cookies=cookies)
+        queued_resp = await client.get(f"{base}/dagRuns?state=queued&limit=100", headers=headers)
         queued = queued_resp.json().get("total_entries", 0) if queued_resp.status_code == 200 else 0
 
         today = (
@@ -110,7 +110,7 @@ async def get_airflow_stats(
             .isoformat()
         )
         today_resp = await client.get(
-            f"{base}/dagRuns?start_date_gte={today}&limit=200", cookies=cookies
+            f"{base}/dagRuns?start_date_gte={today}&limit=200", headers=headers
         )
         runs_today = (
             today_resp.json().get("total_entries", 0) if today_resp.status_code == 200 else 0
@@ -118,7 +118,7 @@ async def get_airflow_stats(
 
         last_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         failed_resp = await client.get(
-            f"{base}/dagRuns?start_date_gte={last_24h}&state=failed&limit=100", cookies=cookies
+            f"{base}/dagRuns?start_date_gte={last_24h}&state=failed&limit=100", headers=headers
         )
         failed_24h = (
             failed_resp.json().get("total_entries", 0) if failed_resp.status_code == 200 else 0

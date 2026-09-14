@@ -50,13 +50,13 @@ _RESPONSE_HEADERS_TO_DROP = _REQUEST_HEADERS_TO_DROP | frozenset(
 def _permission_for_proxy_route(method: str, path: str) -> tuple[str, str]:
     """Map only supported proxy routes to their least-privileged RBAC pair."""
     if method.upper() in _READ_METHODS and (
-        not path.startswith("api/") or path.startswith("api/v1/dags")
+        not path.startswith("api/") or path.startswith("api/v2/dags")
     ):
         return "project.dag.view", "read"
     if (
         method.upper() == "POST"
         and len(path.split("/")) == 5
-        and (path.startswith("api/v1/dags/") and path.endswith("/dagRuns"))
+        and (path.startswith("api/v2/dags/") and path.endswith("/dagRuns"))
     ):
         return "project.dag.run", "write"
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Proxy path not found")
@@ -208,7 +208,7 @@ async def airflow_proxy(
     _validate_cookie_csrf(request)
     context = await resolve_project_airflow_context(slug, user, db, resource, action)
     target_url = _target_url(context, safe_path)
-    session = await AirflowSessionManager().get_session(context, db)
+    access_token = await AirflowSessionManager().get_access_token(context, db)
     body = await request.body()
 
     try:
@@ -217,8 +217,10 @@ async def airflow_proxy(
                 method=request.method,
                 url=target_url,
                 content=body,
-                headers=_forward_request_headers(request),
-                cookies={"session": session},
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    **_forward_request_headers(request),
+                },
                 params=list(request.query_params.multi_items()),
             )
     except httpx.HTTPError as error:

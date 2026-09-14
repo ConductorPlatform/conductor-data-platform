@@ -87,7 +87,7 @@ NON_READY_ROUTE_CASES = (
     RouteCase("POST", "/api/v1/projects/gated-project/airflow/restart"),
     RouteCase("DELETE", "/api/v1/projects/gated-project/airflow"),
     RouteCase("POST", "/api/v1/projects/gated-project/airflow-proxy/bootstrap"),
-    RouteCase("GET", "/api/v1/projects/gated-project/airflow-proxy/api/v1/dags"),
+    RouteCase("GET", "/api/v1/projects/gated-project/airflow-proxy/api/v2/dags"),
     RouteCase("GET", "/api/v1/projects/gated-project/airflow-iframe/home"),
     RouteCase("GET", "/api/v1/projects/gated-project/airflow/dags"),
     RouteCase("GET", "/api/v1/projects/gated-project/airflow/dags/example/runs"),

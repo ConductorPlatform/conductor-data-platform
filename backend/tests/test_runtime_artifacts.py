@@ -7,6 +7,7 @@ import stat
 import subprocess
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -19,7 +20,7 @@ from app.services.runtime_artifacts import (
 
 PROJECT_ID = "0123456789abcdef0123456789abcdef"
 FIXTURE_SECRETS = (
-    "fixture-airflow-db-password",
+    "fixture-airflow-db-password:/?#[]!$&'()*+,;=%%",
     "fixture-airflow-admin-password",
     "fixture-airflow-dev-password",
     "fixture-airflow-viewer-password",
@@ -466,8 +467,11 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
         assert secret not in init_command
     assert "python /home/airflow/bootstrap_airflow_users.py" in init_command
     result_backend = init_service["environment"]["AIRFLOW__CELERY__RESULT_BACKEND"]
-    assert result_backend.startswith(f"db+postgresql://conductor_airflow_{PROJECT_ID}:")
-    assert result_backend.endswith(f"@host.docker.internal:5432/conductor_airflow_{PROJECT_ID}")
+    assert result_backend == (
+        f"db+postgresql://conductor_airflow_{PROJECT_ID}:"
+        f"{quote(FIXTURE_SECRETS[0], safe='')}@host.docker.internal:5432/"
+        f"conductor_airflow_{PROJECT_ID}"
+    )
 
     assert "workspace-session-manager" not in config["services"]
 

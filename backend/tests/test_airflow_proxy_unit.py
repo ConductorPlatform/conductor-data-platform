@@ -33,7 +33,7 @@ def _request(
         {
             "type": "http",
             "method": method,
-            "path": "/api/v1/projects/project-a/airflow-proxy/api/v1/dags",
+            "path": "/api/v1/projects/project-a/airflow-proxy/api/v2/dags",
             "query_string": query_string,
             "headers": [
                 (name.lower().encode(), value.encode()) for name, value in (headers or {}).items()
@@ -46,9 +46,9 @@ def _request(
 @pytest.mark.parametrize(
     ("method", "path", "expected"),
     [
-        ("GET", "api/v1/dags", ("project.dag.view", "read")),
+        ("GET", "api/v2/dags", ("project.dag.view", "read")),
         ("HEAD", "dags/example", ("project.dag.view", "read")),
-        ("POST", "api/v1/dags/example/dagRuns", ("project.dag.run", "write")),
+        ("POST", "api/v2/dags/example/dagRuns", ("project.dag.run", "write")),
     ],
 )
 def test_proxy_route_permission_matrix(method, path, expected):
@@ -73,7 +73,7 @@ def test_proxy_rejects_unsupported_non_dag_writes(method, path):
 
 @pytest.mark.parametrize(
     "path",
-    ["/api/v1/dags", "//evil.test", "https://evil.test", "..%2Fadmin", "safe/../admin", r"\\evil"],
+    ["/api/v2/dags", "//evil.test", "https://evil.test", "..%2Fadmin", "safe/../admin", r"\\evil"],
 )
 def test_proxy_rejects_paths_that_can_change_the_trusted_route(path):
     with pytest.raises(HTTPException) as error:
@@ -91,8 +91,8 @@ def test_proxy_target_is_derived_from_the_persisted_context_only():
         account_key="viewer",
     )
 
-    assert proxy._target_url(context, "api/v1/dags?not-a-query") == (
-        "https://airflow.project-a.test/base/api/v1/dags%3Fnot-a-query"
+    assert proxy._target_url(context, "api/v2/dags?not-a-query") == (
+        "https://airflow.project-a.test/base/api/v2/dags%3Fnot-a-query"
     )
 
 
@@ -208,7 +208,7 @@ async def test_bearer_bootstrap_establishes_browser_proxy_session_without_proxy_
     app = create_app()
     app.dependency_overrides[get_db_session] = db_override
     monkeypatch.setattr(proxy, "resolve_project_airflow_context", authorize)
-    monkeypatch.setattr(proxy.AirflowSessionManager, "get_session", session_for_context)
+    monkeypatch.setattr(proxy.AirflowSessionManager, "get_access_token", session_for_context)
     monkeypatch.setattr(proxy.httpx, "AsyncClient", UpstreamClient)
 
     access_token = create_access_token(user.id, user.email, user.is_admin)
@@ -282,7 +282,7 @@ async def test_cookie_authenticated_unsafe_requests_require_same_origin_proof(mo
     app = create_app()
     app.dependency_overrides[get_db_session] = db_override
     monkeypatch.setattr(proxy, "resolve_project_airflow_context", authorize)
-    monkeypatch.setattr(proxy.AirflowSessionManager, "get_session", forbidden_session)
+    monkeypatch.setattr(proxy.AirflowSessionManager, "get_access_token", forbidden_session)
 
     access_token = create_access_token(user.id, user.email, user.is_admin)
     async with AsyncClient(
@@ -293,10 +293,10 @@ async def test_cookie_authenticated_unsafe_requests_require_same_origin_proof(mo
             headers={"Authorization": f"Bearer {access_token}"},
         )
         missing_proof = await client.post(
-            "/api/v1/projects/project-a/airflow-proxy/api/v1/dags/example/dagRuns"
+            "/api/v1/projects/project-a/airflow-proxy/api/v2/dags/example/dagRuns"
         )
         mismatched_proof = await client.post(
-            "/api/v1/projects/project-a/airflow-proxy/api/v1/dags/example/dagRuns",
+            "/api/v1/projects/project-a/airflow-proxy/api/v2/dags/example/dagRuns",
             headers={"Origin": "https://attacker.test"},
         )
 
@@ -338,12 +338,12 @@ async def test_bearer_dag_run_request_bypasses_cookie_csrf_protection(monkeypatc
             return httpx.Response(200, content=b"ok")
 
     monkeypatch.setattr(proxy, "resolve_project_airflow_context", authorize)
-    monkeypatch.setattr(proxy.AirflowSessionManager, "get_session", session_for_context)
+    monkeypatch.setattr(proxy.AirflowSessionManager, "get_access_token", session_for_context)
     monkeypatch.setattr(proxy.httpx, "AsyncClient", UpstreamClient)
 
     response = await proxy.airflow_proxy(
         "project-a",
-        "api/v1/dags/example/dagRuns",
+        "api/v2/dags/example/dagRuns",
         _request(method="POST", headers={"authorization": "Bearer user-access-token"}),
         cast(User, SimpleNamespace(id="user-a")),
         object(),
@@ -367,7 +367,11 @@ async def test_proxy_authorizes_before_session_or_upstream_request(monkeypatch):
 
     with pytest.raises(HTTPException) as error:
         await proxy.airflow_proxy(
-            "project-a", "api/v1/dags", _request(), SimpleNamespace(id="user-a"), object()
+            "project-a",
+            "api/v2/dags",
+            _request(),
+            cast(User, SimpleNamespace(id="user-a")),
+            object(),
         )
 
     assert error.value.status_code == 403
@@ -417,12 +421,12 @@ async def test_proxy_forwards_only_safe_headers_and_never_exposes_upstream_cooki
             )
 
     monkeypatch.setattr(proxy, "resolve_project_airflow_context", authorize)
-    monkeypatch.setattr(proxy.AirflowSessionManager, "get_session", session_for_context)
+    monkeypatch.setattr(proxy.AirflowSessionManager, "get_access_token", session_for_context)
     monkeypatch.setattr(proxy.httpx, "AsyncClient", UpstreamClient)
 
     response = await proxy.airflow_proxy(
         "project-a",
-        "api/v1/dags",
+        "api/v2/dags",
         _request(
             headers={
                 "authorization": "Bearer user-access-token",
@@ -439,10 +443,12 @@ async def test_proxy_forwards_only_safe_headers_and_never_exposes_upstream_cooki
     )
 
     assert authorize_calls == [("project-a", "user-a", "project.dag.view", "read")]
-    assert captured["url"] == "https://airflow.project-a.test/api/v1/dags"
-    assert captured["cookies"] == {"session": "opaque-airflow-service-cookie"}
+    assert captured["url"] == "https://airflow.project-a.test/api/v2/dags"
     assert captured["params"] == [("tag", "first"), ("tag", "second")]
-    assert captured["headers"] == {"content-type": "application/json"}
+    assert captured["headers"] == {
+        "Authorization": "Bearer opaque-airflow-service-cookie",
+        "content-type": "application/json",
+    }
     assert response.headers["content-type"] == "application/json"
     assert response.headers["x-upstream"] == "safe"
     assert "set-cookie" not in response.headers
@@ -479,7 +485,7 @@ async def test_proxy_replaces_upstream_redirect_with_generic_error(monkeypatch):
             return httpx.Response(302, headers={"location": "https://attacker.test/"})
 
     monkeypatch.setattr(proxy, "resolve_project_airflow_context", authorize)
-    monkeypatch.setattr(proxy.AirflowSessionManager, "get_session", session_for_context)
+    monkeypatch.setattr(proxy.AirflowSessionManager, "get_access_token", session_for_context)
     monkeypatch.setattr(proxy.httpx, "AsyncClient", RedirectingClient)
 
     with pytest.raises(HTTPException) as error:

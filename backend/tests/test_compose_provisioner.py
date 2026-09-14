@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from sqlalchemy import select
@@ -71,7 +72,7 @@ class _ComposeClient:
             "conductor.project_id": deployment.project_id,
             "conductor.template_version": deployment.template_version,
         }
-        return [
+        resources = [
             ObservedComposeResource(
                 RuntimeResourceKind.CONTAINER,
                 "airflow-init",
@@ -80,14 +81,25 @@ class _ComposeClient:
                 "exited",
                 labels,
             ),
-            ObservedComposeResource(
-                RuntimeResourceKind.CONTAINER,
-                "airflow-api-server",
-                "container-id",
-                "project-airflow-api-server",
-                "running",
-                labels,
-            ),
+        ]
+        for service in (
+            "project-redis",
+            "airflow-api-server",
+            "airflow-scheduler",
+            "airflow-dag-processor",
+            "airflow-worker",
+        ):
+            resources.append(
+                ObservedComposeResource(
+                    RuntimeResourceKind.CONTAINER,
+                    service,
+                    f"{service}-container-id",
+                    f"project-{service}",
+                    "running",
+                    labels,
+                )
+            )
+        resources.append(
             ObservedComposeResource(
                 RuntimeResourceKind.NETWORK,
                 "default",
@@ -95,8 +107,9 @@ class _ComposeClient:
                 f"{deployment.compose_project_name}_default",
                 "present",
                 labels,
-            ),
-        ]
+            )
+        )
+        return resources
 
 
 class _ReadinessChecker:
@@ -205,7 +218,15 @@ async def test_provision_saga_is_ordered_resumable_and_publishes_ready_only_afte
     await provisioner.provision(_claimed(job))
 
     assert database.calls == ["role", "database"]
-    assert compose.calls == ["image", "validate", "init", "inspect", "services", "inspect"]
+    assert compose.calls == [
+        "image",
+        "validate",
+        "init",
+        "inspect",
+        "services",
+        "inspect",
+        "inspect",
+    ]
     assert readiness.calls == 1
     async with factory() as session:
         persisted_project = await session.get(Project, project.id)
@@ -222,14 +243,80 @@ async def test_provision_saga_is_ordered_resumable_and_publishes_ready_only_afte
     assert persisted_project.lifecycle_status is ProjectLifecycleStatus.READY
     assert persisted_job is not None
     assert persisted_job.current_step == "ready"
-    assert {(resource.logical_name, resource.observed_status) for resource in resources} == {
-        ("airflow-api-server", "running"),
+    statuses = {resource.logical_name: resource.observed_status for resource in resources}
+    assert {
         ("airflow-init", "exited"),
         ("database", "present"),
         ("default", "present"),
         ("role", "present"),
         ("runtime_artifact", "rendered"),
-    }
+    } <= set(statuses.items())
+    for service in (
+        "project-redis",
+        "airflow-api-server",
+        "airflow-scheduler",
+        "airflow-dag-processor",
+        "airflow-worker",
+    ):
+        assert statuses[service] == "running"
+
+
+class _WorkerExitsAfterReadiness(_ComposeClient):
+    async def inspect_resources(
+        self, artifact, deployment: ProjectDeployment
+    ) -> list[ObservedComposeResource]:
+        resources = await super().inspect_resources(artifact, deployment)
+        if self.calls.count("inspect") != 3:
+            return resources
+        return [
+            ObservedComposeResource(
+                resource.kind,
+                resource.logical_name,
+                resource.provider_id,
+                resource.provider_name,
+                "exited" if resource.logical_name == "airflow-worker" else resource.observed_status,
+                resource.labels,
+            )
+            for resource in resources
+        ]
+
+
+@pytest.mark.asyncio
+async def test_provision_does_not_publish_ready_when_worker_exits_after_api_readiness(
+    _engine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.services.compose_provisioner as provisioner_module
+
+    monkeypatch.setattr(provisioner_module, "decrypt_token", lambda value: value)
+    factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
+    project, job = await _running_job(factory)
+    provisioner = ComposeProvisioner(
+        factory,
+        database_manager=cast(Any, _DatabaseManager()),
+        artifact_writer=RuntimeArtifactWriter(runtime_root=tmp_path / "runtime"),
+        compose_client=cast(Any, _WorkerExitsAfterReadiness()),
+        readiness_checker=cast(Any, _ReadinessChecker()),
+    )
+
+    with pytest.raises(RuntimeError, match="airflow-worker"):
+        await provisioner.provision(_claimed(job))
+
+    async with factory() as session:
+        persisted_project = await session.get(Project, project.id)
+        persisted_job = await session.get(ProjectLifecycleJob, job.id)
+        worker = (
+            await session.execute(
+                select(ProjectRuntimeResource).where(
+                    ProjectRuntimeResource.project_id == project.id,
+                    ProjectRuntimeResource.logical_name == "airflow-worker",
+                )
+            )
+        ).scalar_one()
+    assert persisted_project is not None
+    assert persisted_project.lifecycle_status is ProjectLifecycleStatus.PROVISIONING
+    assert persisted_job is not None
+    assert persisted_job.current_step == "airflow_readiness"
+    assert worker.observed_status == "exited"
 
 
 @pytest.mark.asyncio
@@ -310,6 +397,7 @@ async def test_retry_after_partial_init_reuses_recorded_init_and_only_publishes_
         "image",
         "validate",
         "services",
+        "inspect",
         "inspect",
     ]
     assert readiness.calls == 2

@@ -12,7 +12,7 @@ from app.services.project_airflow_context import ProjectAirflowContext
 
 
 class AirflowSessionManager:
-    """Manages Airflow session cookies with Redis caching (55min TTL)."""
+    """Manages cached Airflow 3 bearer access tokens without exposing credentials."""
 
     def __init__(self) -> None:
         self._redis: aioredis.Redis | None = None
@@ -22,10 +22,10 @@ class AirflowSessionManager:
             self._redis = aioredis.from_url(settings.redis_url, decode_responses=True)
         return self._redis
 
-    async def get_session(self, context: ProjectAirflowContext, db: AsyncSession) -> str:
-        """Get a cached service session without exposing credential material."""
+    async def get_access_token(self, context: ProjectAirflowContext, db: AsyncSession) -> str:
+        """Get a cached Airflow 3 bearer token without exposing credential material."""
         cache_key = (
-            f"airflow_session:{context.deployment_id}:"
+            f"airflow_access_token:{context.deployment_id}:"
             f"{context.deployment_generation}:{context.account_key}"
         )
         deployment = await db.get(ProjectDeployment, context.deployment_id)
@@ -54,24 +54,22 @@ class AirflowSessionManager:
         try:
             password = decrypt_token(encrypted_password)
             async with httpx.AsyncClient() as client:
-                login_response = await client.post(
-                    f"{context.airflow_base_url}/api/v1/login/",
-                    data={"username": username, "password": password},
-                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                token_response = await client.post(
+                    f"{context.airflow_base_url}/auth/token",
+                    json={"username": username, "password": password},
                 )
         except Exception as error:
             raise HTTPException(status_code=502, detail="Airflow authentication failed") from error
 
-        if login_response.status_code != 200:
+        if token_response.status_code != 200:
             raise HTTPException(status_code=502, detail="Airflow authentication failed")
 
-        session_cookie = login_response.cookies.get("session")
-        if not session_cookie:
-            for cookie in login_response.cookies.jar:
-                if cookie.name == "session":
-                    session_cookie = cookie.value
-                    break
+        try:
+            access_token = token_response.json().get("access_token")
+        except ValueError as error:
+            raise HTTPException(status_code=502, detail="Airflow authentication failed") from error
+        if not isinstance(access_token, str) or not access_token:
+            raise HTTPException(status_code=502, detail="Airflow authentication failed")
 
-        if session_cookie:
-            await redis.setex(cache_key, 3300, session_cookie)  # 55 min TTL
-        return session_cookie or ""
+        await redis.setex(cache_key, 3300, access_token)  # 55 min TTL
+        return access_token

@@ -34,6 +34,15 @@ from app.services.runtime_artifacts import (
 _MANAGED_LABEL = "conductor.managed"
 _PROJECT_LABEL = "conductor.project_id"
 _TEMPLATE_LABEL = "conductor.template_version"
+_REQUIRED_RUNTIME_SERVICES = frozenset(
+    {
+        "project-redis",
+        "airflow-api-server",
+        "airflow-scheduler",
+        "airflow-dag-processor",
+        "airflow-worker",
+    }
+)
 
 
 class ComposeClient(Protocol):
@@ -145,7 +154,7 @@ class SubprocessComposeClient:
                     logical_name=service,
                     provider_id=str(container.get("ID") or "") or None,
                     provider_name=name,
-                    observed_status=str(container.get("State") or "unknown"),
+                    observed_status=_container_observed_status(container),
                     labels=labels,
                 )
             )
@@ -255,6 +264,8 @@ class ComposeProvisioner:
 
             await self._set_step(claimed, "airflow_readiness")
             await self._readiness_checker.wait_ready(deployment)
+            resources = await self._record_compose_resources(deployment, artifact)
+            self._require_required_services_running(resources)
 
             await self._publish_ready(claimed)
 
@@ -333,8 +344,9 @@ class ComposeProvisioner:
 
     async def _record_compose_resources(
         self, deployment: ProjectDeployment, artifact: RuntimeArtifact
-    ) -> None:
-        for resource in await self._compose_client.inspect_resources(artifact, deployment):
+    ) -> list[ObservedComposeResource]:
+        resources = await self._compose_client.inspect_resources(artifact, deployment)
+        for resource in resources:
             await self._upsert_resource(
                 deployment,
                 kind=resource.kind,
@@ -343,6 +355,51 @@ class ComposeProvisioner:
                 provider_name=resource.provider_name,
                 observed_status=resource.observed_status,
                 metadata={"labels": resource.labels},
+            )
+        await self._mark_missing_required_services(deployment, resources)
+        return resources
+
+    async def _mark_missing_required_services(
+        self, deployment: ProjectDeployment, resources: list[ObservedComposeResource]
+    ) -> None:
+        observed_services = {
+            resource.logical_name
+            for resource in resources
+            if resource.kind is RuntimeResourceKind.CONTAINER
+        }
+        missing_services = _REQUIRED_RUNTIME_SERVICES - observed_services
+        if not missing_services:
+            return
+        async with self._session_factory() as session:
+            persisted = (
+                await session.execute(
+                    select(ProjectRuntimeResource).where(
+                        ProjectRuntimeResource.project_id == deployment.project_id,
+                        ProjectRuntimeResource.generation == deployment.generation,
+                        ProjectRuntimeResource.resource_kind == RuntimeResourceKind.CONTAINER,
+                        ProjectRuntimeResource.logical_name.in_(missing_services),
+                    )
+                )
+            ).scalars().all()
+            for resource in persisted:
+                resource.observed_status = "absent"
+            await session.commit()
+
+    @staticmethod
+    def _require_required_services_running(resources: list[ObservedComposeResource]) -> None:
+        statuses = {
+            resource.logical_name: resource.observed_status.lower()
+            for resource in resources
+            if resource.kind is RuntimeResourceKind.CONTAINER
+        }
+        unavailable = sorted(
+            service
+            for service in _REQUIRED_RUNTIME_SERVICES
+            if statuses.get(service) != "running"
+        )
+        if unavailable:
+            raise RuntimeError(
+                "Required Airflow runtime services are not running: " + ", ".join(unavailable)
             )
 
     async def _init_completed(self, deployment: ProjectDeployment) -> bool:
@@ -514,6 +571,14 @@ def _json_list(output: str) -> list[dict[str, Any]]:
     if isinstance(decoded, list) and all(isinstance(item, dict) for item in decoded):
         return decoded
     raise ForeignResourceConflictError("Docker inspection returned an unexpected shape")
+
+
+def _container_observed_status(container: dict[str, Any]) -> str:
+    state = str(container.get("State") or "unknown").lower()
+    health = str(container.get("Health") or "").lower()
+    if state != "running":
+        return state
+    return "running" if not health or health == "healthy" else health
 
 
 def _labels(value: object) -> dict[str, str]:
