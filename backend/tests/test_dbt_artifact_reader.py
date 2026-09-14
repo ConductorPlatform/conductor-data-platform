@@ -40,6 +40,9 @@ def _write_attempt(root: Path, *, status: str = "stored", attempt: int = 1) -> P
                 "dag_id": "dag",
                 "dag_run_id": "run",
                 "bundle_commit_sha": COMMIT,
+                "try_number": str(attempt),
+                "stage": "test",
+                "exit_code": 0,
                 "files": {"manifest.json": metadata, "run_results.json": {"status": "missing"}},
             }
         )
@@ -85,6 +88,27 @@ def test_reader_rejects_symlinked_or_tampered_artifacts(tmp_path: Path) -> None:
     (directory / "manifest.json").write_text("tampered")
 
     with pytest.raises(ArtifactIntegrityError):
+        read_run_artifact(
+            artifact_root=tmp_path,
+            project_id=PROJECT_ID,
+            generation=3,
+            dag_id="dag",
+            run_id="run",
+            bundle_commit_sha=COMMIT,
+            artifact_name="manifest.json",
+        )
+
+
+@pytest.mark.parametrize("stage,exit_code", [("deps", 0), ("unknown", 1), ("test", -1)])
+def test_reader_rejects_invalid_execution_index(tmp_path: Path, stage: str, exit_code: int) -> None:
+    directory = _write_attempt(tmp_path)
+    index_path = directory / "index.json"
+    index = json.loads(index_path.read_text())
+    index["stage"] = stage
+    index["exit_code"] = exit_code
+    index_path.write_text(json.dumps(index))
+
+    with pytest.raises(ArtifactIntegrityError, match="execution result"):
         read_run_artifact(
             artifact_root=tmp_path,
             project_id=PROJECT_ID,

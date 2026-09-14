@@ -30,6 +30,9 @@ def _artifact(root: Path) -> None:
         "dag_id": "dag",
         "dag_run_id": "run",
         "bundle_commit_sha": COMMIT,
+        "try_number": "1",
+        "stage": "test",
+        "exit_code": 0,
         "files": {
             "manifest.json": {"status": "stored", "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()},
             "run_results.json": {"status": "missing"},

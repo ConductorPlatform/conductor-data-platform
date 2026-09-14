@@ -63,6 +63,7 @@ def read_run_artifact(
         try:
             index = _load_index(attempt)
             _require_matching_index(index, project_id, generation, dag_id, run_id, commit)
+            _require_execution_invariant(index, attempt)
             files = index.get("files")
             if not isinstance(files, dict) or artifact_name not in files:
                 raise ArtifactIntegrityError("artifact index is invalid")
@@ -116,6 +117,27 @@ def _require_matching_index(
     }
     if any(index.get(key) != value for key, value in expected.items()):
         raise ArtifactIntegrityError("artifact index provenance does not match the run")
+
+
+def _require_execution_invariant(index: dict[str, object], attempt: Path) -> None:
+    """Accept evidence only from one complete, bounded dbt execution attempt."""
+
+    try:
+        attempt_number = int(attempt.name)
+    except ValueError as exc:
+        raise ArtifactIntegrityError("artifact attempt is invalid") from exc
+    stage = index.get("stage")
+    exit_code = index.get("exit_code")
+    if (
+        attempt_number < 1
+        or index.get("try_number") != attempt.name
+        or stage not in {"deps", "run", "test"}
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or exit_code < 0
+        or (exit_code == 0 and stage != "test")
+    ):
+        raise ArtifactIntegrityError("artifact execution result is invalid")
 
 
 def _read_verified_file(path: Path, metadata: object) -> bytes:

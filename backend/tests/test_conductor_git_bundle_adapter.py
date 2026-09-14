@@ -13,12 +13,33 @@ import pytest
 
 def _load_bundle_module(connection=None) -> ModuleType:
     class GitHook:
+        def __init__(self, *, git_conn_id=None, repo_url=None) -> None:
+            configured = BaseHook.get_connection(git_conn_id)
+            self.repo_url = repo_url or configured.host
+            self.user_name = configured.login
+            self.env = {}
+
         @contextmanager
         def configure_hook_env(self):
             yield
 
     class GitDagBundle:
-        pass
+        def __init__(self, *, tracking_ref, subdir=None, git_conn_id=None, **_kwargs) -> None:
+            self.tracking_ref = tracking_ref
+            self.subdir = subdir
+            self.git_conn_id = git_conn_id
+            self.repo_url = None
+            self.hook = None
+            self.calls: list[str] = []
+
+        def initialize(self) -> None:
+            self.calls.append("initialize")
+
+        def _fetch_bare_repo(self) -> None:
+            self.calls.append("fetch")
+
+        def refresh(self) -> None:
+            self.calls.append("refresh")
 
     class BaseHook:
         @staticmethod
@@ -40,6 +61,7 @@ def _load_bundle_module(connection=None) -> ModuleType:
         "airflow.providers.common.compat.sdk": ModuleType("airflow.providers.common.compat.sdk"),
     }
     modules["airflow.providers.git.bundles.git"].GitDagBundle = GitDagBundle
+    modules["airflow.providers.git.bundles.git"].GitHook = GitHook
     modules["airflow.providers.git.hooks.git"].GitHook = GitHook
     modules["airflow.providers.common.compat.sdk"].BaseHook = BaseHook
     previous = {name: sys.modules.get(name) for name in modules}
@@ -128,3 +150,31 @@ def test_dbt_project_dir_resolves_valid_dags_and_dbt_paths_in_the_same_bundle(tm
     (dbt_directory / "dbt_project.yml").write_text("name: synthetic\n")
 
     assert module.dbt_project_dir(str(dag_file)) == str(dbt_directory.resolve())
+
+
+def test_native_bundle_refresh_rereads_connection_metadata_before_fetch() -> None:
+    class Connection:
+        host = "https://git-a.example.test/team/project.git"
+        login = "oauth2"
+        extra_dejson = {
+            "conductor_tracking_ref": "branch-a",
+            "conductor_dags_path": "dags-a",
+            "conductor_dbt_path": "dbt",
+        }
+
+    connection = Connection()
+    module = _load_bundle_module(connection)
+    bundle = module.ConductorGitDagBundle(git_conn_id="conductor_git")
+
+    connection.host = "https://git-b.example.test/team/project.git"
+    connection.extra_dejson = {
+        "conductor_tracking_ref": "branch-b",
+        "conductor_dags_path": "dags-b",
+        "conductor_dbt_path": "dbt",
+    }
+    bundle.refresh()
+
+    assert bundle.calls == ["refresh"]
+    assert bundle.repo_url == "https://git-b.example.test/team/project.git"
+    assert bundle.tracking_ref == "branch-b"
+    assert bundle.subdir == "dags-b"

@@ -15,6 +15,7 @@ from typing import NoReturn
 _ARTIFACT_NAMES = ("manifest.json", "run_results.json")
 _MAX_ARTIFACT_BYTES = 5 * 1024 * 1024
 _SHA = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_DBT_STAGES = ("deps", "run", "test")
 
 
 def _required_env(name: str) -> str:
@@ -78,6 +79,12 @@ def _publish(
     *, artifact_root: Path, project_id: str, generation: str, dag_id: str, run_id: str, commit: str,
     try_number: str, project_workdir: Path, stage: str, exit_code: int,
 ) -> None:
+    if not try_number.isdecimal() or int(try_number) < 1:
+        raise RuntimeError("artifact attempt is invalid")
+    if stage not in _DBT_STAGES or not isinstance(exit_code, int) or exit_code < 0:
+        raise RuntimeError("artifact execution result is invalid")
+    if exit_code == 0 and stage != "test":
+        raise RuntimeError("successful dbt evidence has an incomplete stage")
     final_directory = artifact_root / _digest(dag_id) / _digest(run_id) / commit / try_number
     try:
         final_directory.relative_to(artifact_root)
@@ -134,7 +141,14 @@ def main() -> None:
     exit_code = 0
     with tempfile.TemporaryDirectory(prefix="conductor-dbt-") as temporary:
         workdir = Path(temporary) / "project"
-        shutil.copytree(project_dir, workdir, symlinks=False)
+        # The immutable bundle supplies source only. Never treat a committed
+        # mutable target/ directory as evidence for this Airflow run.
+        shutil.copytree(
+            project_dir,
+            workdir,
+            symlinks=False,
+            ignore=shutil.ignore_patterns("target", "dbt_packages"),
+        )
         for stage, arguments in (("deps", ["dbt", "deps"]), ("run", ["dbt", "run"]), ("test", ["dbt", "test"])):
             completed = subprocess.run(
                 [*arguments, "--profiles-dir", str(profiles_dir)], cwd=workdir, check=False

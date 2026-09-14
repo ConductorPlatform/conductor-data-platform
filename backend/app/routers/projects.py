@@ -796,6 +796,11 @@ async def update_git_config(
     if config.auth_type == "token" and not config.credentials_encrypted:
         raise HTTPException(status_code=422, detail="Token authentication requires a token")
 
+    # Preserve the exact desired external state before a failed database commit
+    # expires or rolls back the ORM object. It is needed to compensate an
+    # initial create as well as an update of an existing GitConfig row.
+    desired_config = copy(config)
+
     # Legacy unauthenticated/SSH configurations remain persisted, but only the
     # token path is an MVP production bundle. Switching away from it revokes
     # the deterministic connection without attempting to support another mode.
@@ -829,7 +834,15 @@ async def update_git_config(
         # locked snapshot after a failed commit, retaining no token if the
         # helper cannot prove a matched old metadata/token pair.
         await db.rollback()
-        if previous_config is not None and deployment is not None:
+        if deployment is not None:
+            rollback_config = previous_config
+            if rollback_config is None:
+                # A failed initial commit has no persisted counterpart. Remove
+                # both the deterministic Airflow connection and token rather
+                # than leaving a live credential without GitConfig authority.
+                rollback_config = copy(desired_config)
+                rollback_config.auth_type = "https"
+                rollback_config.credentials_encrypted = None
             try:
                 await sync_git_dag_connection(
                     context=ProjectAirflowContext(
@@ -839,8 +852,8 @@ async def update_git_config(
                         airflow_base_url=f"http://airflow-{project.id}:8080",
                         account_key="admin",
                     ),
-                    config=previous_config,
-                    previous_config=config,
+                    config=rollback_config,
+                    previous_config=desired_config,
                     db=db,
                 )
             except GitDagBundleSyncError:

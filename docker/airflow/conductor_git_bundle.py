@@ -114,6 +114,39 @@ class ConductorGitDagBundle(GitDagBundle):
         finally:
             git_bundle_module.GitHook = original_hook
 
+    def _reload_connection_metadata(self) -> None:
+        """Refresh mutable connection metadata before every native Git action.
+
+        Airflow 3.3 retains one bundle object in the DAG processor. Reading the
+        deterministic connection again here prevents an old in-memory hook or
+        bare-repository remote from pairing a rotated token with a prior host.
+        Missing/revoked metadata deliberately fails before Git can prompt.
+        """
+
+        tracking_ref, dags_path, _ = _connection_metadata(self.git_conn_id)
+        hook = ConductorGitHook(git_conn_id=self.git_conn_id)
+        if not hook.repo_url:
+            raise ValueError("Conductor Git connection is missing an HTTPS repository URL")
+        self.tracking_ref = tracking_ref
+        self.subdir = dags_path
+        self.hook = hook
+        self.repo_url = hook.repo_url
+        bare_repo = getattr(self, "bare_repo", None)
+        if bare_repo is not None:
+            bare_repo.remotes.origin.set_url(self.repo_url)
+
+    def initialize(self) -> None:
+        self._reload_connection_metadata()
+        super().initialize()
+
+    def _fetch_bare_repo(self) -> None:
+        self._reload_connection_metadata()
+        super()._fetch_bare_repo()
+
+    def refresh(self) -> None:
+        self._reload_connection_metadata()
+        super().refresh()
+
 
 def bundle_repository_root(dag_file: str) -> Path:
     """Find the native bundle checkout without relying on DAG path depth.
