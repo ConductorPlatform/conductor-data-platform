@@ -102,7 +102,9 @@ class ProjectWarehouseManager:
         parsed = urlsplit(self._maintenance_dsn)
         if parsed.scheme not in {"postgresql", "postgres"} or not parsed.netloc:
             raise ValueError("Warehouse maintenance DSN must be a PostgreSQL connection URL")
-        return urlunsplit((parsed.scheme, parsed.netloc, f"/{database_name}", "", ""))
+        return urlunsplit(
+            (parsed.scheme, parsed.netloc, f"/{database_name}", parsed.query, "")
+        )
 
     @asynccontextmanager
     async def _schema_connection(self, deployment: ProjectDeployment) -> AsyncIterator[asyncpg.Connection]:
