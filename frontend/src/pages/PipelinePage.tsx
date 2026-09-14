@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { ApiError, apiFetch } from '../lib/api';
+import { ApiError, apiDownload, apiFetch } from '../lib/api';
+import { useAuth } from '../lib/auth';
 import { StatCard } from '../components/StatCard';
 import { TabBar } from '../components/TabBar';
 
@@ -36,6 +37,10 @@ interface AirflowStats {
   failed_24h: number;
 }
 
+type DAGRunArtifact = DAGRun['artifacts'][number];
+
+const triggerRoles = new Set(['super_admin', 'project_admin', 'maintainer', 'developer']);
+
 const emptyStats = (): AirflowStats => ({
   active_dags: 0,
   paused_dags: 0,
@@ -53,6 +58,7 @@ const errorKind = (error: unknown) =>
 
 export default function PipelinePage() {
   const { slug } = useParams();
+  const { user } = useAuth();
   const [dags, setDags] = useState<DAG[]>([]);
   const [runs, setRuns] = useState<DAGRun[]>([]);
   const [stats, setStats] = useState<AirflowStats>(emptyStats);
@@ -65,6 +71,8 @@ export default function PipelinePage() {
   const [triggerLoading, setTriggerLoading] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [iframePath, setIframePath] = useState<string | null>(null);
+  const projectRole = user?.projects.find((project) => project.slug === slug)?.role;
+  const canTrigger = Boolean(user?.is_admin || (projectRole && triggerRoles.has(projectRole)));
 
   const loadPipeline = useCallback(async () => {
     setLoading(true);
@@ -145,6 +153,21 @@ export default function PipelinePage() {
       setActionError(errorMessage(error));
     } finally {
       setTriggerLoading(false);
+    }
+  };
+
+  const handleDownloadArtifact = async (artifact: DAGRunArtifact) => {
+    setActionError(null);
+    try {
+      const blob = await apiDownload(artifact.download_url);
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = artifact.name;
+      link.click();
+      URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      setActionError(errorMessage(error));
     }
   };
 
@@ -263,9 +286,15 @@ export default function PipelinePage() {
               {run.error_summary && <p className="ml-4 text-xs text-red-300">{run.error_summary}</p>}
               {run.logs_url && <a className="ml-4 text-xs text-[#818cf8] hover:underline" href={run.logs_url}>Logs</a>}
               {run.artifacts?.map((artifact) => (
-                <a key={artifact.name} className="ml-3 text-xs text-[#818cf8] hover:underline" href={artifact.download_url}>
+                <button
+                  key={artifact.name}
+                  type="button"
+                  aria-label={`Download ${artifact.name}`}
+                  onClick={() => void handleDownloadArtifact(artifact)}
+                  className="ml-3 text-xs text-[#818cf8] hover:underline"
+                >
                   {artifact.name}
-                </a>
+                </button>
               ))}
             </div>
           ))}
@@ -283,14 +312,16 @@ export default function PipelinePage() {
         <div className="mt-4">
           <div className="flex items-center gap-2 mb-2 text-sm text-gray-400">
             <span>Airflow graph embedded: <code className="text-[#818cf8]">{selectedDag}</code></span>
-            <button
-              type="button"
-              onClick={() => void handleTrigger()}
-              disabled={triggerLoading}
-              className="ml-auto rounded bg-[#6366f1] px-3 py-1 text-xs text-white disabled:opacity-60"
-            >
-              {triggerLoading ? 'Starting…' : 'Run now'}
-            </button>
+            {canTrigger && (
+              <button
+                type="button"
+                onClick={() => void handleTrigger()}
+                disabled={triggerLoading}
+                className="ml-auto rounded bg-[#6366f1] px-3 py-1 text-xs text-white disabled:opacity-60"
+              >
+                {triggerLoading ? 'Starting…' : 'Run now'}
+              </button>
+            )}
           </div>
           <div className="bg-[#1a1b23] border border-[#2a2b36] rounded-lg overflow-hidden" style={{ height: '400px' }}>
             {iframePath && <iframe src={iframePath} title={`Airflow graph for ${selectedDag}`} className="w-full h-full border-none" sandbox="allow-scripts allow-same-origin" />}

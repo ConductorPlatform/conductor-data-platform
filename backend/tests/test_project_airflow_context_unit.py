@@ -447,7 +447,7 @@ async def test_airflow_stats_uses_all_dags_dag_runs_route(monkeypatch):
     )
     requests: list[httpx.Request] = []
     payloads = [
-        {"dags": [{"is_paused": False}, {"is_paused": True}]},
+        {"dags": [{"dag_id": "active", "is_paused": False}, {"dag_id": "paused", "is_paused": True}]},
         {"total_entries": 3},
         {"total_entries": 2},
         {"total_entries": 8},
@@ -709,3 +709,95 @@ def test_dag_run_info_rejects_malformed_artifact_and_does_not_expose_external_lo
         },
     )
     assert safe_run.logs_url is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{"dags": {}}, {"dags": [None]}, {"dags": [{}]}])
+async def test_list_dags_sanitizes_malformed_nested_airflow_payload(monkeypatch, payload):
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project-a:8080",
+        account_key="dev",
+    )
+
+    async def resolve(*_args):
+        return context
+
+    async def get_access_token(*_args):
+        return "airflow-access-token"
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _url, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", get_access_token)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+
+    with pytest.raises(HTTPException) as error:
+        await widgets.list_dags("project-a", cast(User, SimpleNamespace(id="user-a")), object())
+
+    assert error.value.status_code == 502
+    assert error.value.detail == "Airflow API error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [{"dags": {}}, {"dags": [None]}, {"dags": [{}]}])
+async def test_airflow_stats_sanitizes_malformed_nested_dags_payload(monkeypatch, payload):
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project-a:8080",
+        account_key="dev",
+    )
+
+    async def resolve(*_args):
+        return context
+
+    async def get_access_token(*_args):
+        return "airflow-access-token"
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _url, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", get_access_token)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+
+    with pytest.raises(HTTPException) as error:
+        await widgets.get_airflow_stats(
+            "project-a", cast(User, SimpleNamespace(id="user-a")), object()
+        )
+
+    assert error.value.status_code == 502
+    assert error.value.detail == "Airflow API error"

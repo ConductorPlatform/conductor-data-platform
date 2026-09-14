@@ -37,6 +37,32 @@ def _airflow_error() -> HTTPException:
     return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Airflow API error")
 
 
+def _airflow_dags(data: dict, *, require_dag_id: bool) -> list[dict]:
+    """Validate the nested DAG collection before consuming upstream fields."""
+    dags = data.get("dags")
+    if not isinstance(dags, list):
+        raise _airflow_error()
+
+    validated_dags: list[dict] = []
+    for dag in dags:
+        if not isinstance(dag, dict):
+            raise _airflow_error()
+        if require_dag_id and _optional_string(dag.get("dag_id")) is None:
+            raise _airflow_error()
+        if "is_paused" in dag and not isinstance(dag["is_paused"], bool):
+            raise _airflow_error()
+        validated_dags.append(dag)
+    return validated_dags
+
+
+def _airflow_total_entries(data: dict) -> int:
+    """Return a valid Airflow pagination total without leaking malformed payloads."""
+    total_entries = data.get("total_entries", 0)
+    if isinstance(total_entries, bool) or not isinstance(total_entries, int) or total_entries < 0:
+        raise _airflow_error()
+    return total_entries
+
+
 async def _airflow_get(
     client: httpx.AsyncClient,
     url: str,
@@ -126,6 +152,7 @@ async def list_dags(
             headers={"Authorization": f"Bearer {access_token}"},
         )
     data = _airflow_response_data(resp)
+    dags = _airflow_dags(data, require_dag_id=True)
     return [
         DAGSummary(
             dag_id=dag["dag_id"],
@@ -136,7 +163,7 @@ async def list_dags(
             latest_run_end=None,
             next_dagrun=None,
         )
-        for dag in data.get("dags", [])
+        for dag in dags
     ]
 
 
@@ -220,8 +247,9 @@ async def get_airflow_stats(
 
         dags_resp = await _airflow_get(client, f"{base}/dags", headers=headers)
         dags_data = _airflow_response_data(dags_resp)
-        active = sum(1 for dag in dags_data.get("dags", []) if not dag.get("is_paused", False))
-        paused = sum(1 for dag in dags_data.get("dags", []) if dag.get("is_paused", False))
+        dags = _airflow_dags(dags_data, require_dag_id=True)
+        active = sum(1 for dag in dags if not dag.get("is_paused", False))
+        paused = sum(1 for dag in dags if dag.get("is_paused", False))
 
         dag_runs_url = f"{base}/dags/~/dagRuns"
         running_resp = await _airflow_get(
@@ -230,7 +258,7 @@ async def get_airflow_stats(
             headers=headers,
             params={"state": "running", "limit": 100},
         )
-        running = _airflow_response_data(running_resp).get("total_entries", 0)
+        running = _airflow_total_entries(_airflow_response_data(running_resp))
 
         queued_resp = await _airflow_get(
             client,
@@ -238,7 +266,7 @@ async def get_airflow_stats(
             headers=headers,
             params={"state": "queued", "limit": 100},
         )
-        queued = _airflow_response_data(queued_resp).get("total_entries", 0)
+        queued = _airflow_total_entries(_airflow_response_data(queued_resp))
 
         today = (
             datetime.now(UTC)
@@ -251,7 +279,7 @@ async def get_airflow_stats(
             headers=headers,
             params={"start_date_gte": today, "limit": 200},
         )
-        runs_today = _airflow_response_data(today_resp).get("total_entries", 0)
+        runs_today = _airflow_total_entries(_airflow_response_data(today_resp))
 
         last_24h = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
         failed_resp = await _airflow_get(
@@ -260,7 +288,7 @@ async def get_airflow_stats(
             headers=headers,
             params={"start_date_gte": last_24h, "state": "failed", "limit": 100},
         )
-        failed_24h = _airflow_response_data(failed_resp).get("total_entries", 0)
+        failed_24h = _airflow_total_entries(_airflow_response_data(failed_resp))
 
     return AirflowStatsResponse(
         active_dags=active,
