@@ -32,3 +32,11 @@ def test_application_default_keeps_production_proxy_cookies_secure() -> None:
     config = (Path(__file__).resolve().parents[1] / "app" / "config.py").read_text()
 
     assert "airflow_proxy_cookie_secure: bool = True" in config
+
+
+def test_lifecycle_worker_image_uses_the_compose_release_architecture_name() -> None:
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
+
+    assert "git docker.io docker-cli curl" in dockerfile
+    assert 'case "${TARGETARCH}" in arm64) compose_arch=aarch64' in dockerfile
+    assert "docker-compose-linux-${compose_arch}" in dockerfile

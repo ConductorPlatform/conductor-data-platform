@@ -24,10 +24,11 @@ WORKDIR /app
 # The lifecycle worker uses the Docker CLI through the mounted socket. FastAPI
 # runs from this image too, but only the worker service receives that socket.
 ARG TARGETARCH
-RUN apt-get update && apt-get install -y --no-install-recommends git docker.io curl \
+RUN apt-get update && apt-get install -y --no-install-recommends git docker.io docker-cli curl \
  && mkdir -p /usr/local/lib/docker/cli-plugins \
+ && case "${TARGETARCH}" in arm64) compose_arch=aarch64 ;; *) compose_arch="${TARGETARCH}" ;; esac \
  && curl --fail --silent --show-error --location \
-    "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-${TARGETARCH}" \
+    "https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-${compose_arch}" \
     --output /usr/local/lib/docker/cli-plugins/docker-compose \
  && chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose \
  && rm -rf /var/lib/apt/lists/*
