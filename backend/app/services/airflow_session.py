@@ -61,7 +61,7 @@ class AirflowSessionManager:
         except Exception as error:
             raise HTTPException(status_code=502, detail="Airflow authentication failed") from error
 
-        if token_response.status_code != 200:
+        if not 200 <= token_response.status_code < 300:
             raise HTTPException(status_code=502, detail="Airflow authentication failed")
 
         try:

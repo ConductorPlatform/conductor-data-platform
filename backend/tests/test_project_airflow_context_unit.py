@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from fastapi import HTTPException
@@ -8,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 
 import app.routers.airflow_widgets as widgets
 from app.main import create_app
+from app.models.user import User
 from app.services.airflow_session import AirflowSessionManager
 from app.services.project_airflow_context import (
     ProjectAirflowContext,
@@ -202,7 +205,7 @@ async def test_access_token_uses_airflow_token_endpoint_and_caches_its_bearer_va
         return redis
 
     class TokenResponse:
-        status_code = 200
+        status_code = 201
 
         @staticmethod
         def json():
@@ -246,6 +249,69 @@ async def test_access_token_uses_airflow_token_endpoint_and_caches_its_bearer_va
     assert redis.setex_calls == [
         ("airflow_access_token:deployment-a:7:dev", 3300, "airflow-access-token")
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "payload"),
+    [
+        (401, {"access_token": "unexpected-token"}),
+        (201, {}),
+        (201, {"access_token": ""}),
+        (201, {"access_token": 42}),
+    ],
+)
+async def test_access_token_rejects_unsuccessful_or_invalid_token_response(
+    monkeypatch, status_code, payload
+):
+    import app.services.airflow_session as session_service
+
+    manager = AirflowSessionManager()
+    redis = _Redis()
+
+    async def get_redis():
+        return redis
+
+    class TokenResponse:
+        def __init__(self, response_status_code):
+            self.status_code = response_status_code
+
+        def json(self):
+            return payload
+
+    class TokenClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _url, **_kwargs):
+            return TokenResponse(status_code)
+
+    monkeypatch.setattr(manager, "_get_redis", get_redis)
+    monkeypatch.setattr(session_service, "decrypt_token", lambda value: value)
+    monkeypatch.setattr(session_service.httpx, "AsyncClient", TokenClient)
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project-a:8080",
+        account_key="dev",
+    )
+    deployment = SimpleNamespace(
+        project_id="project-a",
+        generation=7,
+        airflow_dev_user="dev",
+        airflow_dev_password_encrypted="dev-password",
+    )
+
+    with pytest.raises(HTTPException) as error:
+        await manager.get_access_token(context, _SessionDb(deployment))
+
+    assert error.value.status_code == 502
+    assert error.value.detail == "Airflow authentication failed"
+    assert redis.setex_calls == []
 
 
 @pytest.mark.asyncio
@@ -296,3 +362,208 @@ async def test_list_dags_uses_airflow_v2_with_a_bearer_token(monkeypatch):
             {"headers": {"Authorization": "Bearer airflow-access-token"}},
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_dag_runs_maps_airflow_logical_date_to_execution_date(monkeypatch):
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project-a:8080",
+        account_key="dev",
+    )
+    calls = []
+
+    async def resolve(*_args):
+        return context
+
+    async def get_access_token(*_args):
+        return "airflow-access-token"
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {
+                "dag_runs": [
+                    {
+                        "dag_run_id": "scheduled__2026-02-03T04:05:06+00:00",
+                        "state": "success",
+                        "logical_date": "2026-02-03T04:05:06+00:00",
+                        "start_date": "2026-02-03T04:05:10+00:00",
+                        "end_date": "2026-02-03T04:06:12+00:00",
+                        "duration": 62.0,
+                    }
+                ]
+            }
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return Response()
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", get_access_token)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+
+    runs = await widgets.list_dag_runs(
+        "project-a", "example", cast(User, SimpleNamespace(id="user-a")), object()
+    )
+
+    assert runs[0].execution_date == datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC)
+    assert calls == [
+        (
+            "http://airflow-project-a:8080/api/v2/dags/example/dagRuns",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_airflow_stats_uses_all_dags_dag_runs_route(monkeypatch):
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project-a:8080",
+        account_key="dev",
+    )
+    calls = []
+    payloads = [
+        {"dags": [{"is_paused": False}, {"is_paused": True}]},
+        {"total_entries": 3},
+        {"total_entries": 2},
+        {"total_entries": 8},
+        {"total_entries": 1},
+    ]
+
+    async def resolve(*_args):
+        return context
+
+    async def get_access_token(*_args):
+        return "airflow-access-token"
+
+    class FrozenDateTime:
+        @classmethod
+        def now(cls, _timezone):
+            return datetime(2026, 2, 3, 4, 5, 6, tzinfo=UTC)
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return Response(payloads[len(calls) - 1])
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", get_access_token)
+    monkeypatch.setattr(widgets, "datetime", FrozenDateTime)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+
+    stats = await widgets.get_airflow_stats(
+        "project-a", cast(User, SimpleNamespace(id="user-a")), object()
+    )
+
+    assert stats.model_dump() == {
+        "active_dags": 1,
+        "paused_dags": 1,
+        "running": 3,
+        "queued": 2,
+        "runs_today": 8,
+        "failed_24h": 1,
+    }
+    assert calls == [
+        (
+            "http://airflow-project-a:8080/api/v2/dags",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}},
+        ),
+        (
+            "http://airflow-project-a:8080/api/v2/dags/~/dagRuns?state=running&limit=100",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}},
+        ),
+        (
+            "http://airflow-project-a:8080/api/v2/dags/~/dagRuns?state=queued&limit=100",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}},
+        ),
+        (
+            "http://airflow-project-a:8080/api/v2/dags/~/dagRuns?start_date_gte=2026-02-03T00:00:00+00:00&limit=200",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}},
+        ),
+        (
+            "http://airflow-project-a:8080/api/v2/dags/~/dagRuns?start_date_gte=2026-02-02T04:05:06+00:00&state=failed&limit=100",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing_response_index", range(5))
+async def test_airflow_stats_surfaces_each_upstream_error(monkeypatch, failing_response_index):
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project-a:8080",
+        account_key="dev",
+    )
+    calls = []
+
+    async def resolve(*_args):
+        return context
+
+    async def get_access_token(*_args):
+        return "airflow-access-token"
+
+    class Response:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+        @staticmethod
+        def json():
+            return {"dags": [], "total_entries": 0}
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, url, **kwargs):
+            request_index = len(calls)
+            calls.append((url, kwargs))
+            return Response(503 if request_index == failing_response_index else 200)
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", get_access_token)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+
+    with pytest.raises(HTTPException) as error:
+        await widgets.get_airflow_stats(
+            "project-a", cast(User, SimpleNamespace(id="user-a")), object()
+        )
+
+    assert error.value.status_code == 502
+    assert error.value.detail == "Airflow API error"
+    assert len(calls) == failing_response_index + 1
