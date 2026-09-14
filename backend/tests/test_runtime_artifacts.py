@@ -467,14 +467,23 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     }
     assert "postgres" not in config["services"]
     assert "traefik" not in config["services"]
-    assert set(config["volumes"]) == {"dags", "logs"}
+    assert set(config["volumes"]) == {
+        "dags", "logs", "conductor-runtime-secrets", "conductor-dbt-artifacts"
+    }
+    assert config["volumes"]["conductor-runtime-secrets"]["external"] is True
+    assert config["volumes"]["conductor-dbt-artifacts"]["external"] is True
     assert set(config["networks"]) == {"default", "ingress"}
     assert config["networks"]["default"]["name"] == f"conductor-p-{PROJECT_ID}_default"
     assert config["networks"]["default"].get("internal") is not True
     assert config["networks"]["ingress"]["external"] is True
     assert config["networks"]["ingress"]["name"] == "conductor-runtime-ingress"
 
-    for resource in [*config["services"].values(), *config["volumes"].values(), config["networks"]["default"]]:
+    for resource in [
+        *config["services"].values(),
+        config["volumes"]["dags"],
+        config["volumes"]["logs"],
+        config["networks"]["default"],
+    ]:
         labels = resource["labels"]
         assert labels["conductor.managed"] == "true"
         assert labels["conductor.project_id"] == PROJECT_ID
@@ -486,6 +495,9 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     api_service = config["services"]["airflow-api-server"]
     assert api_service["labels"]["traefik.enable"] == "false"
     assert api_service["networks"]["ingress"]["aliases"] == [f"airflow-{PROJECT_ID}"]
+    secret_mount = next(volume for volume in api_service["volumes"] if volume["target"] == "/run/secrets")
+    assert secret_mount["read_only"] is True
+    assert "subpath: ${CONDUCTOR_RUNTIME_SUBPATH}" in TEMPLATE_PATH.read_text()
 
     init_service = config["services"]["airflow-init"]
     assert init_service["extra_hosts"] in (
@@ -535,7 +547,9 @@ def test_template_labels_and_non_secret_artifact_outputs_never_leak_fixture_secr
         json.dumps(
             {
                 "labels": [service["labels"] for service in config["services"].values()],
-                "volume_labels": [volume["labels"] for volume in config["volumes"].values()],
+                "volume_labels": [
+                    volume["labels"] for volume in config["volumes"].values() if "labels" in volume
+                ],
                 "network_labels": config["networks"]["default"]["labels"],
             },
             sort_keys=True,

@@ -64,6 +64,8 @@ def build_default_registry() -> LifecycleRunnerRegistry:
         database_manager=AsyncpgProjectDatabaseManager(maintenance_dsn),
         warehouse_manager=ProjectWarehouseManager(warehouse_maintenance_dsn),
         runtime_root=settings.lifecycle_runtime_root,
+        runtime_secret_root=settings.lifecycle_runtime_secret_root,
+        runtime_artifact_root=settings.lifecycle_runtime_artifact_root,
         runtime_ingress_network=settings.lifecycle_runtime_ingress_network,
         airflow_image=settings.lifecycle_airflow_image,
         airflow_database_host=settings.lifecycle_airflow_database_host,

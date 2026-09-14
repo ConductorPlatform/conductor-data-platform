@@ -115,23 +115,41 @@ class ConductorGitDagBundle(GitDagBundle):
             git_bundle_module.GitHook = original_hook
 
 
+def bundle_repository_root(dag_file: str) -> Path:
+    """Find the native bundle checkout without relying on DAG path depth.
+
+    A bundle can contain DAGs at arbitrary nested locations.  The nearest
+    lexical checkout marker is authoritative; all paths are then resolved and
+    containment-checked before use.
+    """
+
+    dag_path = Path(dag_file)
+    if dag_path.is_symlink() or not dag_path.is_file():
+        raise ValueError("Conductor DAG file is not a regular bundle file")
+    for candidate in (dag_path.parent, *dag_path.parents):
+        marker = candidate / ".git"
+        try:
+            marker_stat = marker.lstat()
+        except FileNotFoundError:
+            continue
+        if marker.is_symlink() or not (stat.S_ISDIR(marker_stat.st_mode) or stat.S_ISREG(marker_stat.st_mode)):
+            raise ValueError("Conductor Git bundle has an unsafe repository marker")
+        root = candidate.resolve()
+        if root == candidate or not candidate.is_symlink():
+            return root
+    raise ValueError("Conductor DAG file is not inside an immutable Git bundle")
+
+
 def dbt_project_dir(dag_file: str, *, git_conn_id: str = _CONNECTION_ID) -> str:
     """Resolve dbt_path inside the full immutable bundle checkout.
 
-    ``GitDagBundle.path`` is the configured DAG subdirectory.  Walking upward
-    by the configured DAG path depth yields its repository root without ever
-    consulting an IDE workspace or a mutable branch checkout.
+    The nearest native checkout marker establishes the root, allowing nested
+    DAG files while still rejecting symlink escapes.
     """
 
     _, dags_path, dbt_path = _connection_metadata(git_conn_id)
     dag_path = Path(dag_file)
-    # Determine the root from the lexical bundle path *before* resolving
-    # symlinks.  Resolving ``dag_path`` first would turn a symlinked dags_path
-    # into a new apparent root outside the materialized repository.
-    repository_root = dag_path.parent
-    for _ in Path(dags_path).parts:
-        repository_root = repository_root.parent
-    repository_root = repository_root.resolve()
+    repository_root = bundle_repository_root(dag_file)
     try:
         dags_dir = (repository_root / dags_path).resolve()
         dags_dir.relative_to(repository_root)

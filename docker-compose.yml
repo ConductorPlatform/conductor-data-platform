@@ -100,6 +100,7 @@ services:
       - ./backend/tests:/app/tests  # test files
       - ./backend/pyproject.toml:/app/pyproject.toml  # for pytest config
       - ./workspaces:/workspace  # shared with code-server
+      - conductor-dbt-artifacts:/var/lib/conductor/dbt-artifacts:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -126,11 +127,15 @@ services:
         postgresql+asyncpg://${CONDUCTOR_DB_USER:-conductor}:${CONDUCTOR_DB_PASSWORD:-conductor}@${CONDUCTOR_DB_HOST:-postgres}:${CONDUCTOR_DB_PORT:-5432}/${CONDUCTOR_DB_NAME:-conductor}
       CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY: ${CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY:?Set CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY to a stable Fernet key}
       CONDUCTOR_LIFECYCLE_RUNTIME_ROOT: /var/lib/conductor/runtimes
+      CONDUCTOR_LIFECYCLE_RUNTIME_SECRET_ROOT: /var/lib/conductor/runtime-secrets
+      CONDUCTOR_LIFECYCLE_RUNTIME_ARTIFACT_ROOT: /var/lib/conductor/dbt-artifacts
       CONDUCTOR_LIFECYCLE_AIRFLOW_IMAGE: ${CONDUCTOR_LIFECYCLE_AIRFLOW_IMAGE:-conductor-airflow:latest}
       CONDUCTOR_LIFECYCLE_WAREHOUSE_MAINTENANCE_DSN: postgresql://${CONDUCTOR_WAREHOUSE_OPERATOR_USER:-conductor_warehouse_operator}:${CONDUCTOR_WAREHOUSE_OPERATOR_PASSWORD:-conductor-warehouse-operator-dev}@warehouse-postgres:5432/${CONDUCTOR_WAREHOUSE_OPERATOR_DATABASE:-conductor_warehouse}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ./runtime:/var/lib/conductor/runtimes
+      - conductor-runtime-secrets:/var/lib/conductor/runtime-secrets
+      - conductor-dbt-artifacts:/var/lib/conductor/dbt-artifacts
     networks:
       default: {}
       runtime_ingress: {}
@@ -199,3 +204,7 @@ volumes:
   postgres_data:
   warehouse_postgres_data:
   frontend_node_modules:
+  conductor-runtime-secrets:
+    name: conductor-runtime-secrets
+  conductor-dbt-artifacts:
+    name: conductor-dbt-artifacts

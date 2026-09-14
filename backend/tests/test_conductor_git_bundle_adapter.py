@@ -97,6 +97,7 @@ def test_dbt_project_dir_rejects_a_symlinked_dags_path_outside_the_bundle(tmp_pa
     module = _load_bundle_module(Connection())
     repository = tmp_path / "repository"
     repository.mkdir()
+    (repository / ".git").mkdir()
     outside_dags = tmp_path / "outside-dags"
     outside_dags.mkdir()
     (outside_dags / "run.py").write_text("# synthetic DAG\n")
@@ -116,6 +117,7 @@ def test_dbt_project_dir_resolves_valid_dags_and_dbt_paths_in_the_same_bundle(tm
 
     module = _load_bundle_module(Connection())
     repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
     dag_directory = repository / "orchestration" / "dags"
     dag_directory.mkdir(parents=True)
     dag_file = dag_directory / "run.py"

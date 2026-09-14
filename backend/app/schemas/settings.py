@@ -82,7 +82,12 @@ class GitConfigUpdateRequest(BaseModel):
             or "@{" in value
             or any(character in value for character in invalid_characters)
             or any(ord(character) < 32 or ord(character) == 127 for character in value)
-            or any(component in ("", ".", "..") or component.endswith(".lock") for component in components)
+            or any(
+                component in ("", ".", "..")
+                or component.startswith(".")
+                or component.endswith(".lock")
+                for component in components
+            )
         ):
             raise ValueError("Production branch is not a safe Git ref")
         return value

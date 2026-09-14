@@ -18,6 +18,8 @@ x-airflow-environment: &airflow-environment
     CONDUCTOR_WAREHOUSE_ROLE: ${WAREHOUSE_DB_ROLE}
     CONDUCTOR_WAREHOUSE_PASSWORD_URLENCODED: ${WAREHOUSE_DB_PASSWORD_URLENCODED}
     CONDUCTOR_WAREHOUSE_SCHEMA: ${WAREHOUSE_SCHEMA}
+    CONDUCTOR_PROJECT_ID: ${CONDUCTOR_PROJECT_ID}
+    CONDUCTOR_RUNTIME_SUBPATH: ${CONDUCTOR_RUNTIME_SUBPATH}
 
 x-airflow-common: &airflow-common
   image: ${AIRFLOW_IMAGE:-conductor-airflow:latest}
@@ -25,7 +27,17 @@ x-airflow-common: &airflow-common
   volumes:
     - dags:/opt/airflow/dags
     - logs:/opt/airflow/logs
-    - ./git-token:/run/secrets/conductor-git-token:ro
+    - type: volume
+      source: conductor-runtime-secrets
+      target: /run/secrets
+      read_only: true
+      volume:
+        subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
+    - type: volume
+      source: conductor-dbt-artifacts
+      target: /opt/airflow/conductor-dbt-artifacts
+      volume:
+        subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
   extra_hosts:
     - host.docker.internal:host-gateway
   depends_on:
@@ -119,3 +131,9 @@ volumes:
       conductor.managed: "true"
       conductor.project_id: ${CONDUCTOR_PROJECT_ID}
       conductor.template_version: ${CONDUCTOR_TEMPLATE_VERSION}
+  conductor-runtime-secrets:
+    name: conductor-runtime-secrets
+    external: true
+  conductor-dbt-artifacts:
+    name: conductor-dbt-artifacts
+    external: true

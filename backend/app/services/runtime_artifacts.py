@@ -77,6 +77,8 @@ class RuntimeArtifactWriter:
         warehouse_host: str = "host.docker.internal",
         warehouse_port: int = 5433,
         template_root: Path = _TEMPLATE_ROOT,
+        secret_root: Path | None = None,
+        artifact_root: Path | None = None,
     ) -> None:
         self._runtime_root = Path(os.path.abspath(runtime_root))
         self._runtime_ingress_network = runtime_ingress_network
@@ -86,6 +88,8 @@ class RuntimeArtifactWriter:
         self._warehouse_host = warehouse_host
         self._warehouse_port = warehouse_port
         self._template_root = template_root.resolve()
+        self._secret_root = Path(os.path.abspath(secret_root or runtime_root))
+        self._artifact_root = Path(os.path.abspath(artifact_root or runtime_root))
 
     def runtime_directory(self, *, project_id: str, generation: int) -> Path:
         _validate_project_id(project_id)
@@ -98,19 +102,27 @@ class RuntimeArtifactWriter:
         return runtime_directory
 
     def git_token_path(self, *, project_id: str, generation: int) -> Path:
-        """Return the private token-file boundary for an existing runtime."""
+        """Return the token boundary in the daemon-managed secret volume."""
 
-        runtime_directory = self.runtime_directory(project_id=project_id, generation=generation)
-        self._ensure_private_project_directory(project_id)
-        _reject_symlink(runtime_directory, "Runtime artifact generation")
-        if not runtime_directory.is_dir():
-            raise ValueError("Runtime artifact generation is not available")
-        return runtime_directory / "git-token"
+        return self.secret_directory(project_id=project_id, generation=generation) / "git-token"
+
+    def runtime_subpath(self, *, project_id: str, generation: int) -> str:
+        """Return the only project-scoped volume subpath exposed to a runtime."""
+
+        _validate_project_id(project_id)
+        _validate_generation(generation)
+        return f"{project_id}/{generation}"
+
+    def secret_directory(self, *, project_id: str, generation: int) -> Path:
+        return _ensure_private_generation_directory(self._secret_root, project_id, generation)
+
+    def artifact_directory(self, *, project_id: str, generation: int) -> Path:
+        return _ensure_private_generation_directory(self._artifact_root, project_id, generation)
 
     def write_git_token(self, *, project_id: str, generation: int, token: str) -> Path:
         """Atomically materialize the Git credential outside Compose and Airflow metadata."""
 
-        if not token or "\x00" in token:
+        if not token or any(character in token for character in ("\x00", "\n", "\r")):
             raise ValueError("Git token must be a non-empty single-line value")
         token_path = self.git_token_path(project_id=project_id, generation=generation)
         _reject_symlink(token_path, "Runtime Git token file")
@@ -165,6 +177,11 @@ class RuntimeArtifactWriter:
             compose_content=compose_content,
             env_content=env_content,
         )
+        # Docker validates `volume.subpath` before starting a container. Create
+        # both roots before any Compose operation so an initially absent token
+        # is represented by an absent file, never a daemon-created directory.
+        self.secret_directory(project_id=spec.project_id, generation=spec.generation)
+        self.artifact_directory(project_id=spec.project_id, generation=spec.generation)
         return RuntimeArtifact(
             project_id=spec.project_id,
             generation=spec.generation,
@@ -306,6 +323,7 @@ def _allowlisted_env(
         "WAREHOUSE_DB_ROLE": spec.warehouse_db_role,
         "WAREHOUSE_DB_PASSWORD_URLENCODED": quote(spec.warehouse_db_password, safe=""),
         "WAREHOUSE_SCHEMA": spec.warehouse_schema,
+        "CONDUCTOR_RUNTIME_SUBPATH": f"{spec.project_id}/{spec.generation}",
     }
 
 
@@ -378,6 +396,24 @@ def _open_private_runtime_root(path: Path) -> int:
         if not stat.S_ISDIR(path_stat.st_mode):
             raise ValueError("CONDUCTOR_RUNTIME_ROOT must be a directory")
     return _open_private_directory(path)
+
+
+def _ensure_private_generation_directory(root: Path, project_id: str, generation: int) -> Path:
+    """Create a no-follow project/generation directory under one trusted root."""
+
+    _validate_project_id(project_id)
+    _validate_generation(generation)
+    root_descriptor = _open_private_runtime_root(root)
+    try:
+        project_descriptor = _open_private_child_directory(root_descriptor, project_id)
+        try:
+            generation_descriptor = _open_private_child_directory(project_descriptor, str(generation))
+        finally:
+            os.close(project_descriptor)
+    finally:
+        os.close(root_descriptor)
+    os.close(generation_descriptor)
+    return root / project_id / str(generation)
 
 
 def _open_private_child_directory(parent_descriptor: int, name: str) -> int:

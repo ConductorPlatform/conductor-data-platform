@@ -21,4 +21,5 @@ RUN pip install --no-cache-dir \
 # ── Idempotent project service-account bootstrap ──
 COPY --chown=airflow:root bootstrap_airflow_users.py /home/airflow/
 COPY --chown=airflow:root conductor_git_bundle.py /opt/airflow/plugins/
+COPY --chown=airflow:root conductor_dbt_artifacts.py /opt/airflow/plugins/
 ENV PYTHONPATH="/opt/airflow/plugins"

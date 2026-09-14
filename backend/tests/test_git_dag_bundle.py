@@ -56,7 +56,10 @@ def test_git_paths_reject_absolute_or_noncanonical_values(path: str) -> None:
 
 @pytest.mark.parametrize(
     "branch",
-    ["bad branch", "main~1", "foo^bar", "foo:bar", "foo?bar", "foo@{bar", "foo.", "@", "topic.lock"],
+    [
+        "bad branch", "main~1", "foo^bar", "foo:bar", "foo?bar", "foo@{bar", "foo.", "@", "topic.lock",
+        ".hidden", "feature/.hidden",
+    ],
 )
 def test_git_branch_validation_matches_git_ref_format_rejections(branch: str) -> None:
     with pytest.raises(ValidationError, match="safe Git ref"):
@@ -160,6 +163,8 @@ async def test_git_dag_connection_sync_creates_secret_free_project_connection(
     project_id = "0123456789abcdef0123456789abcdef"
     runtime_directory = _runtime_dir(tmp_path, project_id)
     monkeypatch.setattr(settings, "lifecycle_runtime_root", tmp_path / "runtimes")
+    monkeypatch.setattr(settings, "lifecycle_runtime_secret_root", tmp_path / "runtimes")
+    monkeypatch.setattr(settings, "lifecycle_runtime_artifact_root", tmp_path / "runtimes")
     monkeypatch.setattr(bundle_service.httpx, "AsyncClient", Client)
     config = GitConfig(
         project_id=project_id,
@@ -217,6 +222,8 @@ async def test_git_dag_connection_sync_reports_sanitized_failure(
     project_id = "0123456789abcdef0123456789abcdef"
     _runtime_dir(tmp_path, project_id)
     monkeypatch.setattr(settings, "lifecycle_runtime_root", tmp_path / "runtimes")
+    monkeypatch.setattr(settings, "lifecycle_runtime_secret_root", tmp_path / "runtimes")
+    monkeypatch.setattr(settings, "lifecycle_runtime_artifact_root", tmp_path / "runtimes")
     monkeypatch.setattr(bundle_service.httpx, "AsyncClient", Client)
     config = GitConfig(
         project_id=project_id,
@@ -265,6 +272,8 @@ async def test_git_dag_connection_revocation_removes_runtime_secret(
     token_path.write_text("git-token")
     token_path.chmod(0o600)
     monkeypatch.setattr(settings, "lifecycle_runtime_root", tmp_path / "runtimes")
+    monkeypatch.setattr(settings, "lifecycle_runtime_secret_root", tmp_path / "runtimes")
+    monkeypatch.setattr(settings, "lifecycle_runtime_artifact_root", tmp_path / "runtimes")
     monkeypatch.setattr(bundle_service.httpx, "AsyncClient", Client)
 
     await sync_git_dag_connection(

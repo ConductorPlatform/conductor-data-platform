@@ -83,7 +83,11 @@ async def sync_git_dag_connection(
     """
 
     manager = session_manager or AirflowSessionManager()
-    token_writer = RuntimeArtifactWriter(runtime_root=settings.lifecycle_runtime_root)
+    token_writer = RuntimeArtifactWriter(
+        runtime_root=settings.lifecycle_runtime_root,
+        secret_root=settings.lifecycle_runtime_secret_root,
+        artifact_root=settings.lifecycle_runtime_artifact_root,
+    )
     admin_context = ProjectAirflowContext(
         project_id=context.project_id,
         deployment_id=context.deployment_id,
@@ -106,11 +110,6 @@ async def sync_git_dag_connection(
                 if response.status_code in (200, 204, 404):
                     return
                 raise GitDagBundleSyncError("Airflow rejected Git connection revocation")
-            token_writer.write_git_token(
-                project_id=context.project_id,
-                generation=context.deployment_generation,
-                token=decrypt_token(config.credentials_encrypted),
-            )
             payload = git_dag_connection_payload(config).as_dict()
             current = await client.get(endpoint, headers=headers)
             if current.status_code == 404:
@@ -128,3 +127,13 @@ async def sync_git_dag_connection(
 
     if not 200 <= response.status_code < 300:
         raise GitDagBundleSyncError("Airflow rejected Git connection update")
+    # Install only after secret-free metadata has been accepted. A failed
+    # initial POST/PATCH cannot leave an unmatched credential behind.
+    try:
+        token_writer.write_git_token(
+            project_id=context.project_id,
+            generation=context.deployment_generation,
+            token=decrypt_token(config.credentials_encrypted),
+        )
+    except ValueError as exc:
+        raise GitDagBundleSyncError("Runtime Git credential is unavailable") from exc
