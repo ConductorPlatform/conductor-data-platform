@@ -125,14 +125,21 @@ def dbt_project_dir(dag_file: str, *, git_conn_id: str = _CONNECTION_ID) -> str:
 
     _, dags_path, dbt_path = _connection_metadata(git_conn_id)
     dag_path = Path(dag_file)
+    # Determine the root from the lexical bundle path *before* resolving
+    # symlinks.  Resolving ``dag_path`` first would turn a symlinked dags_path
+    # into a new apparent root outside the materialized repository.
     repository_root = dag_path.parent
     for _ in Path(dags_path).parts:
         repository_root = repository_root.parent
     repository_root = repository_root.resolve()
     try:
-        dag_path.resolve().relative_to(repository_root)
+        dags_dir = (repository_root / dags_path).resolve()
+        dags_dir.relative_to(repository_root)
+        dag_path.resolve().relative_to(dags_dir)
     except ValueError as exc:
         raise ValueError("Conductor DAG path escapes the immutable Git bundle") from exc
+    if not dags_dir.is_dir():
+        raise ValueError("Conductor DAG path is missing from the immutable Git bundle")
 
     project_dir = (repository_root / dbt_path).resolve()
     try:

@@ -8,8 +8,10 @@ from pathlib import Path
 from types import ModuleType
 from uuid import uuid4
 
+import pytest
 
-def _load_bundle_module() -> ModuleType:
+
+def _load_bundle_module(connection=None) -> ModuleType:
     class GitHook:
         @contextmanager
         def configure_hook_env(self):
@@ -21,7 +23,9 @@ def _load_bundle_module() -> ModuleType:
     class BaseHook:
         @staticmethod
         def get_connection(_connection_id):
-            raise AssertionError("connection lookup is not part of this adapter regression")
+            if connection is None:
+                raise AssertionError("connection lookup is not part of this adapter regression")
+            return connection
 
     modules = {
         "airflow": ModuleType("airflow"),
@@ -80,3 +84,44 @@ def test_private_https_hook_applies_askpass_to_process_and_native_hook_env(tmp_p
     assert hook.env == {"GIT_SSH_COMMAND": "ssh -o StrictHostKeyChecking=yes"}
     for name, value in original.items():
         assert os.environ.get(name) == value
+
+
+def test_dbt_project_dir_rejects_a_symlinked_dags_path_outside_the_bundle(tmp_path) -> None:
+    class Connection:
+        extra_dejson = {
+            "conductor_tracking_ref": "production",
+            "conductor_dags_path": "dags",
+            "conductor_dbt_path": "dbt",
+        }
+
+    module = _load_bundle_module(Connection())
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    outside_dags = tmp_path / "outside-dags"
+    outside_dags.mkdir()
+    (outside_dags / "run.py").write_text("# synthetic DAG\n")
+    (repository / "dags").symlink_to(outside_dags, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="DAG path escapes"):
+        module.dbt_project_dir(str(repository / "dags" / "run.py"))
+
+
+def test_dbt_project_dir_resolves_valid_dags_and_dbt_paths_in_the_same_bundle(tmp_path) -> None:
+    class Connection:
+        extra_dejson = {
+            "conductor_tracking_ref": "production",
+            "conductor_dags_path": "orchestration/dags",
+            "conductor_dbt_path": "transform/dbt",
+        }
+
+    module = _load_bundle_module(Connection())
+    repository = tmp_path / "repository"
+    dag_directory = repository / "orchestration" / "dags"
+    dag_directory.mkdir(parents=True)
+    dag_file = dag_directory / "run.py"
+    dag_file.write_text("# synthetic DAG\n")
+    dbt_directory = repository / "transform" / "dbt"
+    dbt_directory.mkdir(parents=True)
+    (dbt_directory / "dbt_project.yml").write_text("name: synthetic\n")
+
+    assert module.dbt_project_dir(str(dag_file)) == str(dbt_directory.resolve())
