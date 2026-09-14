@@ -345,7 +345,11 @@ async def test_list_dags_uses_airflow_v2_with_a_bearer_token(monkeypatch):
 
         @staticmethod
         def json():
-            return {"dags": [{"dag_id": "example", "description": "Example"}]}
+            return {
+                "dags": [
+                    {"dag_id": "example", "description": "Example", "is_paused": False}
+                ]
+            }
 
     class Client:
         async def __aenter__(self):
@@ -693,6 +697,7 @@ def test_dag_run_info_rejects_malformed_artifact_and_does_not_expose_external_lo
             "example",
             {
                 "dag_run_id": "run-a",
+                "state": "failed",
                 "logical_date": "2026-02-03T04:05:06+00:00",
                 "artifacts": ["not-allowed.json"],
             },
@@ -704,6 +709,7 @@ def test_dag_run_info_rejects_malformed_artifact_and_does_not_expose_external_lo
         "example",
         {
             "dag_run_id": "run-a",
+            "state": "success",
             "logical_date": "2026-02-03T04:05:06+00:00",
             "logs_url": "https://attacker.test/logs",
         },

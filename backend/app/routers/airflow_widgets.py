@@ -49,7 +49,10 @@ def _airflow_dags(data: dict, *, require_dag_id: bool) -> list[dict]:
             raise _airflow_error()
         if require_dag_id and _optional_string(dag.get("dag_id")) is None:
             raise _airflow_error()
-        if "is_paused" in dag and not isinstance(dag["is_paused"], bool):
+        if "is_paused" not in dag or not isinstance(dag["is_paused"], bool):
+            raise _airflow_error()
+        description = dag.get("description")
+        if description is not None and not isinstance(description, str):
             raise _airflow_error()
         validated_dags.append(dag)
     return validated_dags
@@ -57,7 +60,9 @@ def _airflow_dags(data: dict, *, require_dag_id: bool) -> list[dict]:
 
 def _airflow_total_entries(data: dict) -> int:
     """Return a valid Airflow pagination total without leaking malformed payloads."""
-    total_entries = data.get("total_entries", 0)
+    if "total_entries" not in data:
+        raise _airflow_error()
+    total_entries = data["total_entries"]
     if isinstance(total_entries, bool) or not isinstance(total_entries, int) or total_entries < 0:
         raise _airflow_error()
     return total_entries
@@ -80,6 +85,21 @@ async def _airflow_get(
 
 def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _nullable_string(data: dict, field: str) -> str | None:
+    """Return an optional string while rejecting malformed non-null upstream values."""
+    value = data.get(field)
+    if value is not None and not isinstance(value, str):
+        raise _airflow_error()
+    return value
+
+
+def _nullable_duration(data: dict) -> int | float | None:
+    value = data.get("duration")
+    if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+        raise _airflow_error()
+    return value
 
 
 def _project_proxy_url(slug: str, path: object) -> str | None:
@@ -115,21 +135,22 @@ def _dag_run_info(slug: str, dag_id: str, run: object) -> DAGRunInfo:
     if not isinstance(run, dict):
         raise _airflow_error()
     run_id = _optional_string(run.get("dag_run_id"))
+    state = _optional_string(run.get("state"))
     execution_date = run.get("logical_date", run.get("execution_date"))
-    if run_id is None or not isinstance(execution_date, str) or not execution_date:
+    if run_id is None or state is None or not isinstance(execution_date, str) or not execution_date:
         raise _airflow_error()
     try:
         return DAGRunInfo.model_validate(
             {
                 "run_id": run_id,
-                "state": _optional_string(run.get("state")) or "",
+                "state": state,
                 "execution_date": execution_date,
-                "start_date": run.get("start_date"),
-                "end_date": run.get("end_date"),
-                "duration": run.get("duration"),
-                "commit_sha": _optional_string(run.get("commit_sha")),
-                "error_summary": _optional_string(run.get("error_summary")),
-                "logs_url": _project_proxy_url(slug, run.get("logs_url")),
+                "start_date": _nullable_string(run, "start_date"),
+                "end_date": _nullable_string(run, "end_date"),
+                "duration": _nullable_duration(run),
+                "commit_sha": _nullable_string(run, "commit_sha"),
+                "error_summary": _nullable_string(run, "error_summary"),
+                "logs_url": _project_proxy_url(slug, _nullable_string(run, "logs_url")),
                 "artifacts": _dag_run_artifacts(slug, dag_id, run_id, run.get("artifacts")),
             }
         )
@@ -153,18 +174,21 @@ async def list_dags(
         )
     data = _airflow_response_data(resp)
     dags = _airflow_dags(data, require_dag_id=True)
-    return [
-        DAGSummary(
-            dag_id=dag["dag_id"],
-            description=dag.get("description"),
-            is_paused=dag.get("is_paused", False),
-            latest_run_state=None,
-            latest_run_start=None,
-            latest_run_end=None,
-            next_dagrun=None,
-        )
-        for dag in dags
-    ]
+    try:
+        return [
+            DAGSummary(
+                dag_id=dag["dag_id"],
+                description=dag.get("description"),
+                is_paused=dag["is_paused"],
+                latest_run_state=None,
+                latest_run_start=None,
+                latest_run_end=None,
+                next_dagrun=None,
+            )
+            for dag in dags
+        ]
+    except ValidationError as error:
+        raise _airflow_error() from error
 
 
 @router.get("/projects/{slug}/airflow/dags/{dag_id}/runs", response_model=list[DAGRunInfo])
@@ -183,7 +207,7 @@ async def list_dag_runs(
             headers={"Authorization": f"Bearer {access_token}"},
         )
     data = _airflow_response_data(resp)
-    runs = data.get("dag_runs", [])
+    runs = data.get("dag_runs")
     if not isinstance(runs, list):
         raise _airflow_error()
     return [_dag_run_info(slug, dag_id, run) for run in runs]
@@ -248,8 +272,8 @@ async def get_airflow_stats(
         dags_resp = await _airflow_get(client, f"{base}/dags", headers=headers)
         dags_data = _airflow_response_data(dags_resp)
         dags = _airflow_dags(dags_data, require_dag_id=True)
-        active = sum(1 for dag in dags if not dag.get("is_paused", False))
-        paused = sum(1 for dag in dags if dag.get("is_paused", False))
+        active = sum(1 for dag in dags if not dag["is_paused"])
+        paused = sum(1 for dag in dags if dag["is_paused"])
 
         dag_runs_url = f"{base}/dags/~/dagRuns"
         running_resp = await _airflow_get(
