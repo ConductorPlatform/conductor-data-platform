@@ -91,22 +91,24 @@ CONDUCTOR_DB_PASSWORD=replace-with-a-strong-password
 
 Keep `CONDUCTOR_CREDENTIALS_ENCRYPTION_KEY` unchanged for the lifetime of the data. Rotating or losing it makes previously encrypted Git credentials unreadable. The application-specific variables and defaults are documented in [`backend/.env.example`](backend/.env.example).
 
-### 3. Initialise the shared development Airflow database
+### 3. Build the canonical project Airflow image
 
-Run this once for a new Docker volume. It migrates the shared development Airflow metadata database and creates its local admin user:
+Build the exact `conductor-airflow:latest` image used by the worker-generated
+project runtime template:
 
 ```bash
-docker compose --profile init up airflow-db-init
+docker compose build project-airflow-runtime-image
 ```
 
 ### 4. Start the supported local services
 
-Start the control plane, dashboard, shared development Airflow, and their dependencies explicitly. Do not start the example `data-warehouse` or `marketing` Airflow groups until their database provisioning is wired into Compose.
+Start the control plane, dashboard, and the lifecycle worker. The worker is the
+only component that creates project Airflow resources; there is no shared,
+generic, DW, or Marketing Airflow runtime in the root Compose path.
 
 ```bash
 docker compose up -d \
-  postgres redis fastapi frontend \
-  airflow-api-server airflow-scheduler airflow-dag-processor airflow-worker
+  postgres redis fastapi lifecycle-worker frontend
 
 docker compose ps
 ```
@@ -118,7 +120,7 @@ docker compose ps
 | Conductor dashboard | <http://localhost:3000> | Sign in with the seeded `admin@conductor.local` / `admin`, or register a user |
 | Conductor API | <http://localhost:8000/docs> | OpenAPI / Swagger UI |
 | API health check | <http://localhost:8000/api/v1/health> | Reports PostgreSQL and Redis connectivity |
-| Shared development Airflow | <http://localhost:8080> | `admin` / `CONDUCTOR_AIRFLOW_ADMIN_PASSWORD` (defaults to `admin`) |
+| Project Airflow | Browser proxy after project is `READY` | No root shared Airflow service; the proxy cookie is explicitly non-Secure only for this HTTP localhost Compose quick-start |
 | PostgreSQL | `localhost:5432` | `CONDUCTOR_DB_USER` / `CONDUCTOR_DB_PASSWORD` (both default to `conductor`) |
 | Redis | `localhost:6379` | Local development port |
 
@@ -126,11 +128,11 @@ The supplied credentials are development defaults only. Change them before expos
 
 ## Dashboard and API limitations
 
-The dashboard is useful for exercising authentication and inspecting the in-progress UI, but project provisioning, Pipeline, and Development are not currently usable as an end-to-end local workflow.
+The dashboard is useful for exercising authentication and inspecting the in-progress UI. Project provisioning requires the canonical image build and the lifecycle worker; a project is not ready until its generated Airflow runtime passes an authenticated readiness check.
 
-If you call `POST /api/v1/projects` directly, it requires a super-admin bearer token and an `Idempotency-Key` UUID header. It returns an accepted provisioning operation, not a ready project, because no lifecycle runner is configured. The Swagger UI at <http://localhost:8000/docs> is the authoritative reference for the implemented API contracts.
+If you call `POST /api/v1/projects` directly, it requires a super-admin bearer token and an `Idempotency-Key` UUID header. It returns an accepted provisioning operation, not an immediately ready project. The Swagger UI at <http://localhost:8000/docs> is the authoritative reference for the implemented API contracts.
 
-The Compose file defines `data-warehouse` and `marketing` as example project groups on ports `8081` and `8082`, plus code-server on `8443`. They are not part of the supported quick-start path described above. See [Current implementation status](#current-implementation-status) for the present blockers.
+The root Compose file has one build-only canonical project Airflow image target and a worker-managed project runtime path. code-server remains explicitly disabled behind the `mvp-04-ide` profile.
 
 ## Target architecture
 
@@ -251,16 +253,14 @@ docker compose down
 docker compose down -v
 ```
 
-After `docker compose down -v`, repeat the [shared development Airflow initialisation](#3-initialise-the-shared-development-airflow-database) step before starting services again.
+After `docker compose down -v`, rebuild the [canonical project Airflow image](#3-build-the-canonical-project-airflow-image) before provisioning another disposable project.
 
 ### View logs
 
 ```bash
 docker compose logs -f fastapi
 docker compose logs -f frontend
-docker compose logs -f airflow-worker
-docker compose logs -f airflow-scheduler
-docker compose logs -f airflow-api-server
+docker compose logs -f lifecycle-worker
 ```
 
 ### Docker Compose requires an encryption key

@@ -4,6 +4,7 @@ import asyncio
 import json
 import secrets
 import subprocess
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import httpx
@@ -549,3 +550,171 @@ async def test_late_unrelated_integrity_failure_rolls_back_and_returns_redacted_
     assert await db_session.scalar(select(func.count()).select_from(ProjectDeployment)) == 0
     assert await db_session.scalar(select(func.count()).select_from(ProjectLifecycleJob)) == 0
     assert await db_session.scalar(select(func.count()).select_from(AuditEvent)) == 0
+
+
+async def _failed_provision(admin_client, db_session, monkeypatch):
+    monkeypatch.setattr(settings, "credentials_encryption_key", "task-four-test-key-material-32-bytes")
+    created = await admin_client.post(
+        "/api/v1/projects",
+        headers=_idempotency_headers(),
+        json={"name": "Retry Project", "slug": "retry-project"},
+    )
+    assert created.status_code == 202, created.text
+    payload = created.json()
+    project = await db_session.get(Project, payload["project"]["id"])
+    operation = await db_session.get(ProjectLifecycleJob, payload["operation"]["id"])
+    assert project is not None
+    assert operation is not None
+    deployment = (
+        await db_session.execute(
+            select(ProjectDeployment).where(ProjectDeployment.project_id == project.id)
+        )
+    ).scalar_one()
+    project.lifecycle_status = ProjectLifecycleStatus.PROVISION_FAILED
+    operation.status = LifecycleJobStatus.FAILED
+    operation.attempt = operation.max_attempts
+    operation.current_step = "initialize_airflow"
+    operation.error_code = "AIRFLOW_INIT_FAILED"
+    operation.error_message = "password=retry-operation-secret"
+    operation.finished_at = datetime.now(UTC)
+    await db_session.commit()
+    return project, operation, deployment
+
+
+@pytest.mark.asyncio
+async def test_operation_status_is_scoped_and_redacts_persisted_error(
+    admin_client,
+    db_session,
+    monkeypatch,
+):
+    project, operation, _deployment = await _failed_provision(admin_client, db_session, monkeypatch)
+
+    response = await admin_client.get(
+        f"/api/v1/projects/{project.slug}/operations/{operation.id}"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "id": operation.id,
+        "operation": "provision",
+        "status": "failed",
+        "project_status": "provision_failed",
+        "current_step": "initialize_airflow",
+        "attempt": operation.max_attempts,
+        "max_attempts": operation.max_attempts,
+        "error_code": "AIRFLOW_INIT_FAILED",
+        "error_message": "password=[REDACTED]",
+    }
+    assert "retry-operation-secret" not in response.text
+    missing = await admin_client.get(
+        f"/api/v1/projects/{project.slug}/operations/{uuid4().hex}"
+    )
+    assert missing.status_code == 404
+    assert missing.json() == {"detail": "Operation not found"}
+
+
+@pytest.mark.asyncio
+async def test_operation_status_and_retry_require_super_admin(
+    admin_client,
+    client,
+    db_session,
+    monkeypatch,
+):
+    project, operation, _deployment = await _failed_provision(admin_client, db_session, monkeypatch)
+    member = User(
+        email="operation-member@test.local",
+        hashed_password=hash_password("member-password"),
+        display_name="Operation Member",
+        is_active=True,
+        is_admin=False,
+    )
+    db_session.add(member)
+    await db_session.commit()
+    client.headers["Authorization"] = f"Bearer {create_access_token(member.id, member.email, False)}"
+    endpoint = f"/api/v1/projects/{project.slug}/operations/{operation.id}"
+
+    status_response = await client.get(endpoint)
+    retry_response = await client.post(f"{endpoint}/retry", headers=_idempotency_headers())
+
+    assert status_response.status_code == 403
+    assert retry_response.status_code == 403
+    assert await db_session.scalar(select(func.count()).select_from(ProjectLifecycleJob)) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_provision_retry_is_idempotent_and_preserves_deployment_identity(
+    admin_client,
+    db_session,
+    monkeypatch,
+):
+    project, failed, deployment = await _failed_provision(admin_client, db_session, monkeypatch)
+    preserved_identity = (
+        deployment.id,
+        deployment.generation,
+        deployment.compose_project_name,
+        deployment.airflow_db_name,
+        deployment.airflow_db_role,
+        deployment.airflow_db_password_encrypted,
+    )
+    retry_key = str(uuid4())
+    endpoint = f"/api/v1/projects/{project.slug}/operations/{failed.id}/retry"
+
+    first = await admin_client.post(endpoint, headers=_idempotency_headers(retry_key))
+    replay = await admin_client.post(endpoint, headers=_idempotency_headers(retry_key))
+
+    assert first.status_code == replay.status_code == 202
+    assert first.json() == replay.json()
+    retry = await db_session.get(ProjectLifecycleJob, first.json()["id"])
+    assert retry is not None
+    assert retry.id != failed.id
+    assert retry.operation is LifecycleOperation.PROVISION
+    assert retry.status is LifecycleJobStatus.PENDING
+    assert retry.attempt == 0
+    assert retry.max_attempts == failed.max_attempts
+    assert retry.current_step is None
+    assert retry.idempotency_key == retry_key
+    await db_session.refresh(project)
+    await db_session.refresh(deployment)
+    assert project.lifecycle_status is ProjectLifecycleStatus.PROVISIONING
+    assert (
+        deployment.id,
+        deployment.generation,
+        deployment.compose_project_name,
+        deployment.airflow_db_name,
+        deployment.airflow_db_role,
+        deployment.airflow_db_password_encrypted,
+    ) == preserved_identity
+    assert await db_session.scalar(select(func.count()).select_from(ProjectLifecycleJob)) == 2
+    audit = (
+        await db_session.execute(
+            select(AuditEvent).where(AuditEvent.event_type == "project.provision.retry_requested")
+        )
+    ).scalar_one()
+    assert audit.metadata_json == {
+        "operation_id": retry.id,
+        "retry_of_operation_id": failed.id,
+    }
+
+    conflict = await admin_client.post(endpoint, headers=_idempotency_headers())
+    assert conflict.status_code == 409
+    assert conflict.json() == {"detail": "Only a failed project provision can be retried"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_failed_provision_retry_with_same_key_creates_one_operation(
+    admin_client,
+    db_session,
+    monkeypatch,
+):
+    project, failed, _deployment = await _failed_provision(admin_client, db_session, monkeypatch)
+    endpoint = f"/api/v1/projects/{project.slug}/operations/{failed.id}/retry"
+    retry_key = str(uuid4())
+
+    first, second = await asyncio.gather(
+        admin_client.post(endpoint, headers=_idempotency_headers(retry_key)),
+        admin_client.post(endpoint, headers=_idempotency_headers(retry_key)),
+    )
+
+    assert first.status_code == second.status_code == 202
+    assert first.json() == second.json()
+    assert await db_session.scalar(select(func.count()).select_from(ProjectLifecycleJob)) == 2

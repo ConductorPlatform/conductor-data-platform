@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
-from pathlib import Path
 import re
 import shutil
 import stat
+from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from app.services.lifecycle_errors import InvalidTemplateError
 from app.services.project_lifecycle import validate_runtime_parameters
 
-
 _PROJECT_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _SLUG_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62})$")
 _DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_NETWORK_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,62}$")
+_IMAGE_REFERENCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/@:+-]{0,255}$")
 _TEMPLATE_ROOT = Path(__file__).resolve().parents[1] / "runtime_templates"
 _TRUSTED_TEMPLATE_VERSIONS = frozenset({"v1"})
 
@@ -61,8 +62,21 @@ class RuntimeArtifact:
 class RuntimeArtifactWriter:
     """Copy trusted Compose templates and write their allowlisted ENV atomically."""
 
-    def __init__(self, *, runtime_root: Path, template_root: Path = _TEMPLATE_ROOT) -> None:
+    def __init__(
+        self,
+        *,
+        runtime_root: Path,
+        runtime_ingress_network: str = "conductor-runtime-ingress",
+        airflow_image: str = "conductor-airflow:latest",
+        airflow_database_host: str = "host.docker.internal",
+        airflow_database_port: int = 5432,
+        template_root: Path = _TEMPLATE_ROOT,
+    ) -> None:
         self._runtime_root = Path(os.path.abspath(runtime_root))
+        self._runtime_ingress_network = runtime_ingress_network
+        self._airflow_image = airflow_image
+        self._airflow_database_host = airflow_database_host
+        self._airflow_database_port = airflow_database_port
         self._template_root = template_root.resolve()
 
     def runtime_directory(self, *, project_id: str, generation: int) -> Path:
@@ -79,7 +93,13 @@ class RuntimeArtifactWriter:
         """Render a private, deterministic artifact from trusted desired state only."""
 
         template_path = self._template_path(spec.template_version)
-        _validate_spec(spec)
+        _validate_spec(
+            spec,
+            runtime_ingress_network=self._runtime_ingress_network,
+            airflow_image=self._airflow_image,
+            airflow_database_host=self._airflow_database_host,
+            airflow_database_port=self._airflow_database_port,
+        )
         runtime_directory = self.runtime_directory(
             project_id=spec.project_id,
             generation=spec.generation,
@@ -88,7 +108,15 @@ class RuntimeArtifactWriter:
         compose_path = runtime_directory / "compose.yaml"
         env_path = runtime_directory / ".env"
         compose_content = template_path.read_bytes()
-        env_content = _serialize_env(_allowlisted_env(spec)).encode()
+        env_content = _serialize_env(
+            _allowlisted_env(
+                spec,
+                runtime_ingress_network=self._runtime_ingress_network,
+                airflow_image=self._airflow_image,
+                airflow_database_host=self._airflow_database_host,
+                airflow_database_port=self._airflow_database_port,
+            )
+        ).encode()
 
         _publish_generation_atomically(
             runtime_directory=runtime_directory,
@@ -146,7 +174,14 @@ def _validate_generation(generation: int) -> None:
         raise ValueError("generation must be a positive integer")
 
 
-def _validate_spec(spec: RuntimeArtifactSpec) -> None:
+def _validate_spec(
+    spec: RuntimeArtifactSpec,
+    *,
+    runtime_ingress_network: str,
+    airflow_image: str,
+    airflow_database_host: str,
+    airflow_database_port: int,
+) -> None:
     _validate_project_id(spec.project_id)
     _validate_generation(spec.generation)
     validate_runtime_parameters(spec.parameters)
@@ -161,13 +196,30 @@ def _validate_spec(spec: RuntimeArtifactSpec) -> None:
         raise ValueError("project_slug must be a canonical project slug")
 
     _airflow_external_host(spec.airflow_external_url)
+    _validate_runtime_ingress_network(runtime_ingress_network)
+    _validate_airflow_image(airflow_image)
+    _validate_airflow_database_host(airflow_database_host)
+    _validate_airflow_database_port(airflow_database_port)
 
-    for name, value in _allowlisted_env(spec).items():
+    for name, value in _allowlisted_env(
+        spec,
+        runtime_ingress_network=runtime_ingress_network,
+        airflow_image=airflow_image,
+        airflow_database_host=airflow_database_host,
+        airflow_database_port=airflow_database_port,
+    ).items():
         if not value or "\x00" in value or "\n" in value or "\r" in value:
             raise ValueError(f"{name} must be a non-empty single-line value")
 
 
-def _allowlisted_env(spec: RuntimeArtifactSpec) -> dict[str, str]:
+def _allowlisted_env(
+    spec: RuntimeArtifactSpec,
+    *,
+    runtime_ingress_network: str,
+    airflow_image: str,
+    airflow_database_host: str,
+    airflow_database_port: int,
+) -> dict[str, str]:
     """Return the only values the static template may interpolate."""
 
     airflow_host = _airflow_external_host(spec.airflow_external_url)
@@ -175,8 +227,13 @@ def _allowlisted_env(spec: RuntimeArtifactSpec) -> dict[str, str]:
         "COMPOSE_PROJECT_NAME": spec.compose_project_name,
         "CONDUCTOR_PROJECT_ID": spec.project_id,
         "CONDUCTOR_TEMPLATE_VERSION": spec.template_version,
+        "CONDUCTOR_RUNTIME_INGRESS_NETWORK": runtime_ingress_network,
+        "AIRFLOW_IMAGE": airflow_image,
         "PROJECT_SLUG": spec.project_slug,
         "AIRFLOW_EXTERNAL_HOST": airflow_host,
+        "AIRFLOW_INTERNAL_ALIAS": f"airflow-{spec.project_id}",
+        "AIRFLOW_DATABASE_HOST": airflow_database_host,
+        "AIRFLOW_DATABASE_PORT": str(airflow_database_port),
         "AIRFLOW_DB_NAME": spec.airflow_db_name,
         "AIRFLOW_DB_ROLE": spec.airflow_db_role,
         "AIRFLOW_DB_PASSWORD_URLENCODED": quote(spec.airflow_db_password, safe=""),
@@ -189,6 +246,30 @@ def _allowlisted_env(spec: RuntimeArtifactSpec) -> dict[str, str]:
         "AIRFLOW_INTEGRATION_USER": spec.airflow_integration_user,
         "AIRFLOW_INTEGRATION_PASSWORD": spec.airflow_integration_password,
     }
+
+
+def _validate_runtime_ingress_network(value: str) -> None:
+    if not isinstance(value, str) or not _NETWORK_NAME_PATTERN.fullmatch(value):
+        raise ValueError("runtime_ingress_network must be a canonical Docker network name")
+
+
+def _validate_airflow_image(value: str) -> None:
+    if not isinstance(value, str) or not _IMAGE_REFERENCE_PATTERN.fullmatch(value):
+        raise ValueError("airflow_image must be a canonical container image reference")
+
+
+def _validate_airflow_database_host(value: str) -> None:
+    if (
+        not isinstance(value, str)
+        or len(value) > 253
+        or any(not _DNS_LABEL_PATTERN.fullmatch(label) for label in value.split("."))
+    ):
+        raise ValueError("airflow_database_host must be a canonical DNS hostname")
+
+
+def _validate_airflow_database_port(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise ValueError("airflow_database_port must be between 1 and 65535")
 
 
 def _serialize_env(values: dict[str, str]) -> str:
