@@ -11,6 +11,7 @@ from app.services.compose_provisioner import build_compose_provisioner
 from app.services.lifecycle_errors import PermanentLifecycleError
 from app.services.lifecycle_queue import ClaimedJob
 from app.services.project_database import AsyncpgProjectDatabaseManager
+from app.services.project_warehouse import ProjectWarehouseManager
 
 LifecycleRunner = Callable[[ClaimedJob], Awaitable[None]]
 
@@ -19,6 +20,12 @@ class RunnerNotConfiguredError(PermanentLifecycleError):
     """No trusted runner has been registered for a lifecycle operation."""
 
     code = "RUNNER_NOT_CONFIGURED"
+
+
+class WarehouseMaintenanceConfigurationError(PermanentLifecycleError):
+    """The isolated warehouse cannot safely fall back to a metadata database."""
+
+    code = "WAREHOUSE_MAINTENANCE_DSN_REQUIRED"
 
 
 class LifecycleRunnerRegistry:
@@ -47,14 +54,24 @@ def build_default_registry() -> LifecycleRunnerRegistry:
     maintenance_dsn = settings.lifecycle_maintenance_database_dsn or settings.database_url.replace(
         "postgresql+asyncpg://", "postgresql://", 1
     )
+    warehouse_maintenance_dsn = settings.lifecycle_warehouse_maintenance_dsn
+    if not warehouse_maintenance_dsn:
+        raise WarehouseMaintenanceConfigurationError(
+            "A separate lifecycle warehouse maintenance DSN must be configured"
+        )
     provisioner = build_compose_provisioner(
         async_session_factory,
         database_manager=AsyncpgProjectDatabaseManager(maintenance_dsn),
+        warehouse_manager=ProjectWarehouseManager(warehouse_maintenance_dsn),
         runtime_root=settings.lifecycle_runtime_root,
+        runtime_secret_root=settings.lifecycle_runtime_secret_root,
+        runtime_artifact_root=settings.lifecycle_runtime_artifact_root,
         runtime_ingress_network=settings.lifecycle_runtime_ingress_network,
         airflow_image=settings.lifecycle_airflow_image,
         airflow_database_host=settings.lifecycle_airflow_database_host,
         airflow_database_port=settings.lifecycle_airflow_database_port,
+        warehouse_host=settings.lifecycle_warehouse_host,
+        warehouse_port=settings.lifecycle_warehouse_port,
         readiness_timeout_seconds=settings.lifecycle_airflow_ready_timeout_seconds,
         readiness_poll_seconds=settings.lifecycle_airflow_ready_poll_seconds,
     )

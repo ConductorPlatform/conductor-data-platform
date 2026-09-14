@@ -41,11 +41,18 @@ class Settings(BaseSettings):
     lifecycle_retry_cap_seconds: float = Field(default=300.0, gt=0, allow_inf_nan=False)
     lifecycle_retry_jitter_seconds: float = Field(default=1.0, ge=0, allow_inf_nan=False)
     lifecycle_runtime_root: Path = Path("/var/lib/conductor/runtimes")
+    # Global Docker volumes are mounted into trusted backend components. Project
+    # stacks receive only an already-created project/generation subpath.
+    lifecycle_runtime_secret_root: Path = Path("/var/lib/conductor/runtime-secrets")
+    lifecycle_runtime_artifact_root: Path = Path("/var/lib/conductor/dbt-artifacts")
     lifecycle_runtime_ingress_network: str = "conductor-runtime-ingress"
     lifecycle_airflow_image: str = "conductor-airflow:latest"
     lifecycle_airflow_database_host: str = "host.docker.internal"
     lifecycle_airflow_database_port: int = Field(default=5432, ge=1, le=65535)
     lifecycle_maintenance_database_dsn: str | None = None
+    lifecycle_warehouse_maintenance_dsn: str | None = None
+    lifecycle_warehouse_host: str = "host.docker.internal"
+    lifecycle_warehouse_port: int = Field(default=5433, ge=1, le=65535)
     lifecycle_airflow_ready_timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
     lifecycle_airflow_ready_poll_seconds: float = Field(default=2.0, gt=0, allow_inf_nan=False)
 

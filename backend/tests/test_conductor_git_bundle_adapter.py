@@ -1,0 +1,230 @@
+from __future__ import annotations
+
+import importlib.util
+import os
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from types import ModuleType
+from uuid import uuid4
+
+import pytest
+
+
+def _load_bundle_module(connection=None) -> ModuleType:
+    class GitHook:
+        def __init__(self, *, git_conn_id=None, repo_url=None) -> None:
+            configured = BaseHook.get_connection(git_conn_id)
+            self.repo_url = repo_url or configured.host
+            self.user_name = configured.login
+            self.env = {}
+
+        @contextmanager
+        def configure_hook_env(self):
+            yield
+
+    class GitDagBundle:
+        def __init__(self, *, tracking_ref, subdir=None, git_conn_id=None, **_kwargs) -> None:
+            self.tracking_ref = tracking_ref
+            self.subdir = subdir
+            self.git_conn_id = git_conn_id
+            self.repo_url = None
+            self.hook = None
+            self.calls: list[str] = []
+
+        def initialize(self) -> None:
+            self.calls.append("initialize")
+
+        def _fetch_bare_repo(self) -> None:
+            self.calls.append("fetch")
+
+        def refresh(self) -> None:
+            self.calls.append("refresh")
+
+    class BaseHook:
+        @staticmethod
+        def get_connection(_connection_id):
+            if connection is None:
+                raise AssertionError("connection lookup is not part of this adapter regression")
+            return connection
+
+    modules = {
+        "airflow": ModuleType("airflow"),
+        "airflow.providers": ModuleType("airflow.providers"),
+        "airflow.providers.git": ModuleType("airflow.providers.git"),
+        "airflow.providers.git.bundles": ModuleType("airflow.providers.git.bundles"),
+        "airflow.providers.git.bundles.git": ModuleType("airflow.providers.git.bundles.git"),
+        "airflow.providers.git.hooks": ModuleType("airflow.providers.git.hooks"),
+        "airflow.providers.git.hooks.git": ModuleType("airflow.providers.git.hooks.git"),
+        "airflow.providers.common": ModuleType("airflow.providers.common"),
+        "airflow.providers.common.compat": ModuleType("airflow.providers.common.compat"),
+        "airflow.providers.common.compat.sdk": ModuleType("airflow.providers.common.compat.sdk"),
+    }
+    modules["airflow.providers.git.bundles.git"].GitDagBundle = GitDagBundle
+    modules["airflow.providers.git.bundles.git"].GitHook = GitHook
+    modules["airflow.providers.git.hooks.git"].GitHook = GitHook
+    modules["airflow.providers.common.compat.sdk"].BaseHook = BaseHook
+    previous = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
+        source = Path(__file__).resolve().parents[2] / "docker/airflow/conductor_git_bundle.py"
+        module_name = f"conductor_git_bundle_test_{uuid4().hex}"
+        spec = importlib.util.spec_from_file_location(module_name, source)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, prior in previous.items():
+            if prior is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = prior
+
+
+def test_private_https_hook_applies_askpass_to_process_and_native_hook_env(tmp_path, monkeypatch) -> None:
+    module = _load_bundle_module()
+    token_file = tmp_path / "git-token"
+    token_file.write_text("tracked-private-token")
+    token_file.chmod(0o600)
+    monkeypatch.setattr(module, "_TOKEN_FILE", token_file)
+    hook = module.ConductorGitHook.__new__(module.ConductorGitHook)
+    hook.repo_url = "https://git.example.test/team/project.git"
+    hook.user_name = "oauth2"
+    hook.env = {"GIT_SSH_COMMAND": "ssh -o StrictHostKeyChecking=yes"}
+    original = {name: os.environ.get(name) for name in ("GIT_ASKPASS", "CONDUCTOR_GIT_TOKEN_FILE", "GIT_TERMINAL_PROMPT")}
+
+    with hook.configure_hook_env():
+        assert hook.env["CONDUCTOR_GIT_TOKEN_FILE"] == str(token_file)
+        assert hook.env["GIT_TERMINAL_PROMPT"] == "0"
+        assert os.environ["CONDUCTOR_GIT_TOKEN_FILE"] == str(token_file)
+        assert os.environ["GIT_TERMINAL_PROMPT"] == "0"
+        askpass = Path(os.environ["GIT_ASKPASS"])
+        assert askpass.is_file()
+        assert "tracked-private-token" not in askpass.read_text()
+
+    assert hook.env == {"GIT_SSH_COMMAND": "ssh -o StrictHostKeyChecking=yes"}
+    for name, value in original.items():
+        assert os.environ.get(name) == value
+
+
+def test_dbt_project_dir_rejects_a_symlinked_dags_path_outside_the_bundle(tmp_path) -> None:
+    class Connection:
+        extra_dejson = {
+            "conductor_tracking_ref": "production",
+            "conductor_dags_path": "dags",
+            "conductor_dbt_path": "dbt",
+        }
+
+    module = _load_bundle_module(Connection())
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / ".git").mkdir()
+    outside_dags = tmp_path / "outside-dags"
+    outside_dags.mkdir()
+    (outside_dags / "run.py").write_text("# synthetic DAG\n")
+    (repository / "dags").symlink_to(outside_dags, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="not a regular bundle file"):
+        module.dbt_project_dir(str(repository / "dags" / "run.py"))
+
+
+def test_dbt_project_dir_rejects_an_intermediate_symlink_to_an_outside_checkout(tmp_path) -> None:
+    class Connection:
+        extra_dejson = {
+            "conductor_tracking_ref": "production",
+            "conductor_dags_path": "orchestration/link/dags",
+            "conductor_dbt_path": "orchestration/link/dbt",
+        }
+
+    module = _load_bundle_module(Connection())
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    outside = tmp_path / "outside"
+    (outside / ".git").mkdir(parents=True)
+    dag_file = outside / "dags" / "nested" / "run.py"
+    dag_file.parent.mkdir(parents=True)
+    dag_file.write_text("# synthetic DAG\n")
+    (outside / "dbt").mkdir()
+    (outside / "dbt" / "dbt_project.yml").write_text("name: synthetic\n")
+    orchestration = repository / "orchestration"
+    orchestration.mkdir()
+    (orchestration / "link").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="not a regular bundle file"):
+        module.dbt_project_dir(str(orchestration / "link" / "dags" / "nested" / "run.py"))
+
+
+def test_dbt_project_dir_rejects_a_symlinked_dbt_project_file(tmp_path) -> None:
+    class Connection:
+        extra_dejson = {
+            "conductor_tracking_ref": "production",
+            "conductor_dags_path": "dags",
+            "conductor_dbt_path": "dbt",
+        }
+
+    module = _load_bundle_module(Connection())
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    dag_file = repository / "dags" / "nested" / "run.py"
+    dag_file.parent.mkdir(parents=True)
+    dag_file.write_text("# synthetic DAG\n")
+    project_directory = repository / "dbt"
+    project_directory.mkdir()
+    outside_project = tmp_path / "outside-project.yml"
+    outside_project.write_text("name: outside\n")
+    (project_directory / "dbt_project.yml").symlink_to(outside_project)
+
+    with pytest.raises(ValueError, match="dbt project is missing"):
+        module.dbt_project_dir(str(dag_file))
+
+
+def test_dbt_project_dir_resolves_valid_dags_and_dbt_paths_in_the_same_bundle(tmp_path) -> None:
+    class Connection:
+        extra_dejson = {
+            "conductor_tracking_ref": "production",
+            "conductor_dags_path": "orchestration/dags",
+            "conductor_dbt_path": "transform/dbt",
+        }
+
+    module = _load_bundle_module(Connection())
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    dag_directory = repository / "orchestration" / "dags"
+    dag_directory.mkdir(parents=True)
+    dag_file = dag_directory / "nested" / "more" / "run.py"
+    dag_file.parent.mkdir(parents=True)
+    dag_file.write_text("# synthetic DAG\n")
+    dbt_directory = repository / "transform" / "dbt"
+    dbt_directory.mkdir(parents=True)
+    (dbt_directory / "dbt_project.yml").write_text("name: synthetic\n")
+
+    assert module.dbt_project_dir(str(dag_file)) == str(dbt_directory.resolve())
+
+
+def test_native_bundle_refresh_rereads_connection_metadata_before_fetch() -> None:
+    class Connection:
+        host = "https://git-a.example.test/team/project.git"
+        login = "oauth2"
+        extra_dejson = {
+            "conductor_tracking_ref": "branch-a",
+            "conductor_dags_path": "dags-a",
+            "conductor_dbt_path": "dbt",
+        }
+
+    connection = Connection()
+    module = _load_bundle_module(connection)
+    bundle = module.ConductorGitDagBundle(git_conn_id="conductor_git")
+
+    connection.host = "https://git-b.example.test/team/project.git"
+    connection.extra_dejson = {
+        "conductor_tracking_ref": "branch-b",
+        "conductor_dags_path": "dags-b",
+        "conductor_dbt_path": "dbt",
+    }
+    bundle.refresh()
+
+    assert bundle.calls == ["refresh"]
+    assert bundle.repo_url == "https://git-b.example.test/team/project.git"
+    assert bundle.tracking_ref == "branch-b"
+    assert bundle.subdir == "dags-b"

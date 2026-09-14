@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -49,6 +50,46 @@ class GitConfigUpdateRequest(BaseModel):
     def reject_blank_credentials(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("Credential must not be blank")
+        return value
+
+    @field_validator("dbt_path", "dags_path")
+    @classmethod
+    def require_canonical_repository_directory(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        if not value or value in (".", "./") or "\\" in value or "\x00" in value or value.startswith("/"):
+            raise ValueError("Path must be a repository-relative POSIX directory")
+        path = PurePosixPath(value)
+        if str(path) != value or any(part in ("", ".", "..") for part in path.parts):
+            raise ValueError("Path must be a repository-relative POSIX directory")
+        return str(path)
+
+    @field_validator("default_branch")
+    @classmethod
+    def reject_unsafe_git_ref(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        invalid_characters = " ~^:?*[\\"
+        components = value.split("/")
+        if (
+            not value
+            or value == "@"
+            or value.startswith("-")
+            or value.startswith("/")
+            or value.endswith("/")
+            or value.endswith(".")
+            or ".." in value
+            or "@{" in value
+            or any(character in value for character in invalid_characters)
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            or any(
+                component in ("", ".", "..")
+                or component.startswith(".")
+                or component.endswith(".lock")
+                for component in components
+            )
+        ):
+            raise ValueError("Production branch is not a safe Git ref")
         return value
 
     @model_validator(mode="after")

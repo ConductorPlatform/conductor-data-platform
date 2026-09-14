@@ -11,10 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 USER airflow
 
-# ── FAB auth manager + dbt-core for project runtimes ──
+# ── FAB auth manager + accepted dbt-postgres runtime adapter ──
 RUN pip install --no-cache-dir \
     "apache-airflow-providers-fab" \
-    "dbt-core==2.0.0a4"
+    "apache-airflow-providers-git==0.4.0" \
+    "dbt-core==1.11.4" \
+    "dbt-postgres==1.11.0"
 
 # ── Idempotent project service-account bootstrap ──
 COPY --chown=airflow:root bootstrap_airflow_users.py /home/airflow/
+COPY --chown=airflow:root conductor_git_bundle.py /opt/airflow/plugins/
+COPY --chown=airflow:root conductor_dbt_artifacts.py /opt/airflow/plugins/
+ENV PYTHONPATH="/opt/airflow/plugins"

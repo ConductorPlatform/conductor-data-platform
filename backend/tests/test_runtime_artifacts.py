@@ -25,9 +25,19 @@ FIXTURE_SECRETS = (
     "fixture-airflow-dev-password",
     "fixture-airflow-viewer-password",
     "fixture-airflow-integration-password",
+    "fixture-warehouse-password:/?#[]!$&'()*+,;=%%",
 )
 TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "app/runtime_templates/v1/compose.yaml"
 ENV_FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures/runtime-v1.env"
+
+
+def test_runtime_bundle_configuration_retains_git_metadata_for_versioned_checkouts() -> None:
+    template = TEMPLATE_PATH.read_text()
+
+    # Both the nested DAG resolver and the immutable artifact helper derive the
+    # run's checkout root and commit from its native .git metadata. Provider-git
+    # otherwise removes that directory after materializing version=<SHA>.
+    assert '"prune_dotgit_folder":false' in template
 
 
 @pytest.fixture
@@ -50,6 +60,10 @@ def runtime_spec() -> RuntimeArtifactSpec:
         airflow_viewer_password=FIXTURE_SECRETS[3],
         airflow_integration_user="integration",
         airflow_integration_password=FIXTURE_SECRETS[4],
+        warehouse_db_name=f"conductor_warehouse_{PROJECT_ID}",
+        warehouse_db_role=f"conductor_warehouse_{PROJECT_ID}",
+        warehouse_db_password=FIXTURE_SECRETS[5],
+        warehouse_schema="analytics",
         parameters={},
     )
 
@@ -101,6 +115,31 @@ def test_runtime_root_and_artifact_directories_are_private(tmp_path: Path, runti
     assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
     assert stat.S_IMODE((tmp_path / PROJECT_ID).stat().st_mode) == 0o700
     assert stat.S_IMODE(artifact.runtime_directory.stat().st_mode) == 0o700
+
+
+def test_runtime_git_token_is_private_and_rejects_symlink_escape(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec
+) -> None:
+    writer = RuntimeArtifactWriter(runtime_root=tmp_path)
+    artifact = writer.render(runtime_spec)
+
+    token_path = writer.write_git_token(
+        project_id=runtime_spec.project_id,
+        generation=runtime_spec.generation,
+        token="test-git-token",
+    )
+
+    assert token_path.parent == artifact.runtime_directory
+    assert token_path.read_text() == "test-git-token"
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+    token_path.unlink()
+    token_path.symlink_to(tmp_path / "outside-token")
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        writer.write_git_token(
+            project_id=runtime_spec.project_id,
+            generation=runtime_spec.generation,
+            token="another-token",
+        )
 
 
 @pytest.mark.parametrize("symlink_component", ["runtime-root", "project-id", "generation"])
@@ -437,14 +476,23 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     }
     assert "postgres" not in config["services"]
     assert "traefik" not in config["services"]
-    assert set(config["volumes"]) == {"dags", "logs"}
+    assert set(config["volumes"]) == {
+        "dags", "logs", "conductor-runtime-secrets", "conductor-dbt-artifacts"
+    }
+    assert config["volumes"]["conductor-runtime-secrets"]["external"] is True
+    assert config["volumes"]["conductor-dbt-artifacts"]["external"] is True
     assert set(config["networks"]) == {"default", "ingress"}
     assert config["networks"]["default"]["name"] == f"conductor-p-{PROJECT_ID}_default"
     assert config["networks"]["default"].get("internal") is not True
     assert config["networks"]["ingress"]["external"] is True
     assert config["networks"]["ingress"]["name"] == "conductor-runtime-ingress"
 
-    for resource in [*config["services"].values(), *config["volumes"].values(), config["networks"]["default"]]:
+    for resource in [
+        *config["services"].values(),
+        config["volumes"]["dags"],
+        config["volumes"]["logs"],
+        config["networks"]["default"],
+    ]:
         labels = resource["labels"]
         assert labels["conductor.managed"] == "true"
         assert labels["conductor.project_id"] == PROJECT_ID
@@ -456,6 +504,29 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     api_service = config["services"]["airflow-api-server"]
     assert api_service["labels"]["traefik.enable"] == "false"
     assert api_service["networks"]["ingress"]["aliases"] == [f"airflow-{PROJECT_ID}"]
+    secret_mount = next(volume for volume in api_service["volumes"] if volume["target"] == "/run/secrets")
+    assert secret_mount["read_only"] is True
+    api_artifact_mount = next(
+        volume for volume in api_service["volumes"] if volume["target"] == "/opt/airflow/conductor-dbt-artifacts"
+    )
+    assert api_artifact_mount["read_only"] is True
+    processor_artifact_mount = next(
+        volume
+        for volume in config["services"]["airflow-dag-processor"]["volumes"]
+        if volume["target"] == "/opt/airflow/conductor-dbt-artifacts"
+    )
+    assert processor_artifact_mount["read_only"] is True
+    worker_artifact_mount = next(
+        volume
+        for volume in config["services"]["airflow-worker"]["volumes"]
+        if volume["target"] == "/opt/airflow/conductor-dbt-artifacts"
+    )
+    assert worker_artifact_mount.get("read_only") is not True
+    assert not any(
+        volume["target"] == "/opt/airflow/conductor-dbt-artifacts"
+        for volume in config["services"]["airflow-scheduler"]["volumes"]
+    )
+    assert "subpath: ${CONDUCTOR_RUNTIME_SUBPATH}" in TEMPLATE_PATH.read_text()
 
     init_service = config["services"]["airflow-init"]
     assert init_service["extra_hosts"] in (
@@ -505,7 +576,9 @@ def test_template_labels_and_non_secret_artifact_outputs_never_leak_fixture_secr
         json.dumps(
             {
                 "labels": [service["labels"] for service in config["services"].values()],
-                "volume_labels": [volume["labels"] for volume in config["volumes"].values()],
+                "volume_labels": [
+                    volume["labels"] for volume in config["volumes"].values() if "labels" in volume
+                ],
                 "network_labels": config["networks"]["default"]["labels"],
             },
             sort_keys=True,

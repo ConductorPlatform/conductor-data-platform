@@ -1,0 +1,225 @@
+"""Server-side synchronization of the one supported GitDagBundle connection."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+
+import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.git_config import GitConfig
+from app.services.airflow_session import AirflowSessionManager
+from app.config import settings
+from app.services.crypto import decrypt_token
+from app.services.project_airflow_context import ProjectAirflowContext
+from app.services.runtime_artifacts import RuntimeArtifactWriter
+
+_CONNECTION_ID = "conductor_git"
+
+
+class GitDagBundleSyncError(RuntimeError):
+    """A project Git setting could not be applied to its Airflow runtime."""
+
+
+@dataclass(frozen=True)
+class GitDagConnectionPayload:
+    connection_id: str
+    conn_type: str
+    host: str
+    login: str
+    password: str
+    extra: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "connection_id": self.connection_id,
+            "conn_type": self.conn_type,
+            "host": self.host,
+            "login": self.login,
+            "password": self.password,
+            "extra": self.extra,
+        }
+
+
+def git_dag_connection_payload(config: GitConfig) -> GitDagConnectionPayload:
+    """Build secret-free connection metadata for the native bundle."""
+
+    if config.auth_type != "token" or not config.credentials_encrypted:
+        raise ValueError("The MVP GitDagBundle path requires an HTTPS token configuration")
+    if not config.repo_url.startswith("https://"):
+        raise ValueError("The MVP GitDagBundle path requires an HTTPS repository URL")
+    metadata = {
+        "conductor_tracking_ref": config.default_branch,
+        "conductor_dags_path": config.dags_path,
+        "conductor_dbt_path": config.dbt_path,
+    }
+    return GitDagConnectionPayload(
+        connection_id=_CONNECTION_ID,
+        conn_type="git",
+        host=config.repo_url,
+        login="oauth2",
+        # The encrypted GitConfig is the authority.  The decrypted value is
+        # materialized only into a 0600 project runtime file; Airflow metadata
+        # deliberately carries no repository credential.
+        password="",
+        extra=json.dumps(metadata, separators=(",", ":"), sort_keys=True),
+    )
+
+
+async def sync_git_dag_connection(
+    *,
+    context: ProjectAirflowContext,
+    config: GitConfig,
+    db: AsyncSession,
+    session_manager: AirflowSessionManager | None = None,
+    previous_config: GitConfig | None = None,
+) -> None:
+    """Create, update, or revoke only the deterministic project Git connection.
+
+    The bearer token and repository credential are held only in process memory
+    for this request.  Failure leaves the database setting intact so an admin
+    can retry the same update; it is never exposed in the error returned to the
+    caller.
+    """
+
+    manager = session_manager or AirflowSessionManager()
+    token_writer = RuntimeArtifactWriter(
+        runtime_root=settings.lifecycle_runtime_root,
+        secret_root=settings.lifecycle_runtime_secret_root,
+        artifact_root=settings.lifecycle_runtime_artifact_root,
+    )
+    admin_context = ProjectAirflowContext(
+        project_id=context.project_id,
+        deployment_id=context.deployment_id,
+        deployment_generation=context.deployment_generation,
+        airflow_base_url=context.airflow_base_url,
+        account_key="admin",
+    )
+    access_token = await manager.get_access_token(admin_context, db)
+    headers = {"Authorization": f"Bearer {access_token}"}
+    endpoint = f"{context.airflow_base_url}/api/v2/connections/{_CONNECTION_ID}"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            if config.auth_type != "token":
+                # Revocation fails closed: a failed DELETE must never leave a
+                # still-readable credential for a possibly stale connection.
+                token_writer.revoke_git_token(
+                    project_id=context.project_id, generation=context.deployment_generation
+                )
+                response = await client.delete(endpoint, headers=headers)
+                if response.status_code not in (200, 204, 404):
+                    raise GitDagBundleSyncError("Airflow rejected Git connection revocation")
+                return
+
+            desired_payload = git_dag_connection_payload(config).as_dict()
+            metadata_changed = previous_config is None or _connection_metadata_changed(
+                previous_config, config
+            )
+            if metadata_changed:
+                # Never pair the desired token with a cached old host/ref/path.
+                token_writer.revoke_git_token(
+                    project_id=context.project_id, generation=context.deployment_generation
+                )
+            try:
+                await _upsert_connection(
+                    client, context.airflow_base_url, endpoint, headers, desired_payload,
+                    update_existing=metadata_changed,
+                )
+                token_writer.write_git_token(
+                    project_id=context.project_id,
+                    generation=context.deployment_generation,
+                    token=decrypt_token(config.credentials_encrypted),
+                )
+            except (httpx.HTTPError, ValueError, GitDagBundleSyncError) as exc:
+                # A failed lookup has not mutated remote metadata, so there is
+                # nothing to compensate and mock-free callers retain its
+                # specific sanitized diagnostic.
+                if isinstance(exc, GitDagBundleSyncError) and "lookup" in str(exc):
+                    raise
+                if metadata_changed:
+                    await _restore_previous_connection(
+                        client=client,
+                        context=context,
+                        headers=headers,
+                        previous_config=previous_config,
+                        token_writer=token_writer,
+                    )
+                raise GitDagBundleSyncError("Airflow Git connection update failed") from exc
+    except GitDagBundleSyncError:
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        raise GitDagBundleSyncError("Airflow Git connection is unavailable") from exc
+
+
+def _connection_metadata_changed(previous: GitConfig, desired: GitConfig) -> bool:
+    return any(
+        getattr(previous, field) != getattr(desired, field)
+        for field in ("repo_url", "default_branch", "dags_path", "dbt_path", "auth_type")
+    )
+
+
+async def _upsert_connection(
+    client: httpx.AsyncClient,
+    base_url: str,
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict[str, str],
+    *,
+    update_existing: bool,
+) -> None:
+    current = await client.get(endpoint, headers=headers)
+    if current.status_code == 404:
+        response = await client.post(f"{base_url}/api/v2/connections", headers=headers, json=payload)
+    elif 200 <= current.status_code < 300:
+        if not update_existing:
+            return
+        response = await client.patch(endpoint, headers=headers, json=payload)
+    else:
+        raise GitDagBundleSyncError("Airflow rejected Git connection lookup")
+    if not 200 <= response.status_code < 300:
+        raise GitDagBundleSyncError("Airflow rejected Git connection update")
+
+
+async def _restore_previous_connection(
+    *,
+    client: httpx.AsyncClient,
+    context: ProjectAirflowContext,
+    headers: dict[str, str],
+    previous_config: GitConfig | None,
+    token_writer: RuntimeArtifactWriter,
+) -> None:
+    """Restore only a verified old pair; otherwise retain the safe absent token."""
+
+    token_writer.revoke_git_token(
+        project_id=context.project_id, generation=context.deployment_generation
+    )
+    if previous_config is None or previous_config.auth_type != "token":
+        response = await client.delete(
+            f"{context.airflow_base_url}/api/v2/connections/{_CONNECTION_ID}", headers=headers
+        )
+        if response.status_code not in (200, 204, 404):
+            raise GitDagBundleSyncError("Airflow Git connection compensation failed")
+        return
+    try:
+        endpoint = f"{context.airflow_base_url}/api/v2/connections/{_CONNECTION_ID}"
+        await _upsert_connection(
+            client,
+            context.airflow_base_url,
+            endpoint,
+            headers,
+            git_dag_connection_payload(previous_config).as_dict(),
+            update_existing=True,
+        )
+        token_writer.write_git_token(
+            project_id=context.project_id,
+            generation=context.deployment_generation,
+            token=decrypt_token(previous_config.credentials_encrypted),
+        )
+    except (httpx.HTTPError, ValueError, GitDagBundleSyncError):
+        # A failed compensation leaves the credential absent. Do not hide the
+        # original problem or resurrect an unmatched secret.
+        token_writer.revoke_git_token(
+            project_id=context.project_id, generation=context.deployment_generation
+        )

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_current_user
@@ -12,7 +13,14 @@ from app.models.user import User
 from app.schemas.airflow import AirflowStatsResponse
 from app.schemas.dag import DAGRunInfo, DAGSummary
 from app.services.airflow_session import AirflowSessionManager
+from app.services.dbt_artifact_reader import (
+    ArtifactIntegrityError,
+    ArtifactNotFoundError,
+    ArtifactUnavailableError,
+    read_run_artifact,
+)
 from app.services.project_airflow_context import resolve_project_airflow_context
+from app.config import settings
 
 router = APIRouter()
 
@@ -84,6 +92,53 @@ async def list_dag_runs(
         )
         for run in data.get("dag_runs", [])
     ]
+
+
+@router.get("/projects/{slug}/airflow/dags/{dag_id}/runs/{run_id}/artifacts/{artifact_name}")
+async def get_dbt_run_artifact(
+    slug: str,
+    dag_id: str,
+    run_id: str,
+    artifact_name: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Serve only the two indexed dbt artifacts for the exact Airflow run."""
+
+    context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
+    access_token = await AirflowSessionManager().get_access_token(context, db)
+    async with httpx.AsyncClient() as client:
+        upstream = await client.get(
+            f"{context.airflow_base_url}/api/v2/dags/{quote(dag_id, safe='')}/dagRuns/{quote(run_id, safe='')}",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    if upstream.status_code == 404:
+        raise HTTPException(status_code=404, detail="Airflow run not found")
+    run = _airflow_response_data(upstream)
+    bundle_version = run.get("bundle_version")
+    if not isinstance(bundle_version, str):
+        raise HTTPException(status_code=502, detail="Airflow run provenance is unavailable")
+    try:
+        artifact = read_run_artifact(
+            artifact_root=settings.lifecycle_runtime_artifact_root,
+            project_id=context.project_id,
+            generation=context.deployment_generation,
+            dag_id=dag_id,
+            run_id=run_id,
+            bundle_commit_sha=bundle_version,
+            artifact_name=artifact_name,
+        )
+    except ArtifactNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Artifact not found") from exc
+    except ArtifactUnavailableError as exc:
+        raise HTTPException(status_code=409, detail="Artifact was not stored") from exc
+    except ArtifactIntegrityError as exc:
+        raise HTTPException(status_code=502, detail="Artifact integrity verification failed") from exc
+    return Response(
+        content=artifact.content,
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{artifact.filename}"'},
+    )
 
 
 @router.get("/projects/{slug}/airflow/stats", response_model=AirflowStatsResponse)

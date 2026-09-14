@@ -19,6 +19,7 @@ from app.models.project_runtime_resource import ProjectRuntimeResource, RuntimeR
 from app.services.compose_provisioner import ComposeProvisioner, ObservedComposeResource, _json_list
 from app.services.lifecycle_queue import ClaimedJob, JobOwnershipError
 from app.services.project_database import ObservedDatabaseResource
+from app.services.project_warehouse import ObservedWarehouseResource
 from app.services.runtime_artifacts import RuntimeArtifact, RuntimeArtifactWriter
 
 
@@ -47,6 +48,25 @@ class _DatabaseManager:
 
     async def verify_absent(self, _deployment: ProjectDeployment) -> bool:
         raise AssertionError("Provisioning must not verify deletion")
+
+
+class _WarehouseManager:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def ensure_warehouse(
+        self, deployment: ProjectDeployment
+    ) -> tuple[ObservedWarehouseResource, ObservedWarehouseResource, ObservedWarehouseResource]:
+        self.calls.append("warehouse")
+        return (
+            ObservedWarehouseResource("role", deployment.warehouse_db_role, deployment.project_id),
+            ObservedWarehouseResource(
+                "database", deployment.warehouse_db_name, deployment.project_id, deployment.warehouse_db_role
+            ),
+            ObservedWarehouseResource(
+                "schema", deployment.warehouse_schema, deployment.project_id, deployment.warehouse_db_role
+            ),
+        )
 
 
 class _ComposeClient:
@@ -162,6 +182,10 @@ async def _running_job(factory: async_sessionmaker[AsyncSession]) -> tuple[Proje
             airflow_viewer_password_encrypted="viewer-password",
             airflow_integration_user="integration",
             airflow_integration_password_encrypted="integration-password",
+            warehouse_db_name=f"conductor_warehouse_{project.id}",
+            warehouse_db_role=f"conductor_warehouse_{project.id}",
+            warehouse_db_password_encrypted="warehouse-password",
+            warehouse_schema="analytics",
             parameters={},
         )
         job = ProjectLifecycleJob(

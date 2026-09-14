@@ -17,13 +17,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.project import Project, ProjectLifecycleStatus
 from app.models.project_deployment import ProjectDeployment
+from app.models.git_config import GitConfig
 from app.models.project_lifecycle_job import LifecycleJobStatus, ProjectLifecycleJob
 from app.models.project_runtime_resource import ProjectRuntimeResource, RuntimeResourceKind
 from app.services.crypto import decrypt_token
 from app.services.lifecycle_errors import ForeignResourceConflictError, InvalidComposeError
 from app.services.lifecycle_queue import ClaimedJob, JobOwnershipError
 from app.services.project_database import ObservedDatabaseResource, ProjectDatabaseManager
+from app.services.project_warehouse import ObservedWarehouseResource, ProjectWarehouseManager
 from app.services.project_lifecycle import assert_transition
+from app.services.git_dag_bundle import GitDagBundleSyncError, sync_git_dag_connection
+from app.services.project_airflow_context import ProjectAirflowContext
 from app.services.runtime_artifacts import (
     RuntimeArtifact,
     RuntimeArtifactSpec,
@@ -225,9 +229,11 @@ class ComposeProvisioner:
         artifact_writer: RuntimeArtifactWriter,
         compose_client: ComposeClient,
         readiness_checker: AirflowReadinessChecker,
+        warehouse_manager: ProjectWarehouseManager | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._database_manager = database_manager
+        self._warehouse_manager = warehouse_manager
         self._artifact_writer = artifact_writer
         self._compose_client = compose_client
         self._readiness_checker = readiness_checker
@@ -244,6 +250,11 @@ class ComposeProvisioner:
             await self._set_step(claimed, "database")
             database = await self._database_manager.ensure_database(deployment)
             await self._record_database_resource(deployment, database)
+
+            if self._warehouse_manager is not None:
+                await self._set_step(claimed, "warehouse")
+                for resource in await self._warehouse_manager.ensure_warehouse(deployment):
+                    await self._record_warehouse_resource(deployment, resource)
 
             await self._set_step(claimed, "configuration")
             artifact = self._artifact_writer.render(_artifact_spec(project, deployment))
@@ -267,7 +278,34 @@ class ComposeProvisioner:
             resources = await self._record_compose_resources(deployment, artifact)
             self._require_required_services_running(resources)
 
+            await self._set_step(claimed, "git_connection")
+            await self._converge_git_connection(project, deployment)
+
             await self._publish_ready(claimed)
+
+    async def _converge_git_connection(self, project: Project, deployment: ProjectDeployment) -> None:
+        """Install an existing token config only after authenticated readiness."""
+
+        async with self._session_factory() as session:
+            config = (
+                await session.execute(select(GitConfig).where(GitConfig.project_id == project.id))
+            ).scalar_one_or_none()
+            if config is None or config.auth_type != "token":
+                return
+            try:
+                await sync_git_dag_connection(
+                    context=ProjectAirflowContext(
+                        project_id=project.id,
+                        deployment_id=deployment.id,
+                        deployment_generation=deployment.generation,
+                        airflow_base_url=f"http://{_internal_airflow_alias(project.id)}:8080",
+                        account_key="admin",
+                    ),
+                    config=config,
+                    db=session,
+                )
+            except GitDagBundleSyncError as exc:
+                raise ForeignResourceConflictError("Initial Git connection could not be converged") from exc
 
     @asynccontextmanager
     async def _project_lock(self, project_id: str):
@@ -327,6 +365,23 @@ class ComposeProvisioner:
             deployment,
             kind=kind,
             logical_name=resource.kind,
+            provider_name=resource.name,
+            observed_status="present",
+            metadata={"owner": resource.owner} if resource.owner else {},
+        )
+
+    async def _record_warehouse_resource(
+        self, deployment: ProjectDeployment, resource: ObservedWarehouseResource
+    ) -> None:
+        kind = (
+            RuntimeResourceKind.DATABASE_ROLE
+            if resource.kind == "role"
+            else RuntimeResourceKind.DATABASE
+        )
+        await self._upsert_resource(
+            deployment,
+            kind=kind,
+            logical_name=f"warehouse_{resource.kind}",
             provider_name=resource.name,
             observed_status="present",
             metadata={"owner": resource.owner} if resource.owner else {},
@@ -485,6 +540,7 @@ def build_compose_provisioner(
     session_factory: async_sessionmaker[AsyncSession],
     *,
     database_manager: ProjectDatabaseManager,
+    warehouse_manager: ProjectWarehouseManager,
     runtime_root: Path,
     readiness_timeout_seconds: float,
     readiness_poll_seconds: float,
@@ -492,16 +548,25 @@ def build_compose_provisioner(
     airflow_image: str = "conductor-airflow:latest",
     airflow_database_host: str = "host.docker.internal",
     airflow_database_port: int = 5432,
+    warehouse_host: str = "host.docker.internal",
+    warehouse_port: int = 5433,
+    runtime_secret_root: Path | None = None,
+    runtime_artifact_root: Path | None = None,
 ) -> ComposeProvisioner:
     return ComposeProvisioner(
         session_factory,
         database_manager=database_manager,
+        warehouse_manager=warehouse_manager,
         artifact_writer=RuntimeArtifactWriter(
             runtime_root=runtime_root,
             runtime_ingress_network=runtime_ingress_network,
             airflow_image=airflow_image,
             airflow_database_host=airflow_database_host,
             airflow_database_port=airflow_database_port,
+            warehouse_host=warehouse_host,
+            warehouse_port=warehouse_port,
+            secret_root=runtime_secret_root,
+            artifact_root=runtime_artifact_root,
         ),
         compose_client=SubprocessComposeClient(airflow_image=airflow_image),
         readiness_checker=HttpAirflowReadinessChecker(
@@ -530,8 +595,20 @@ def _artifact_spec(project: Project, deployment: ProjectDeployment) -> RuntimeAr
         airflow_viewer_password=decrypt_token(deployment.airflow_viewer_password_encrypted),
         airflow_integration_user=deployment.airflow_integration_user,
         airflow_integration_password=decrypt_token(deployment.airflow_integration_password_encrypted),
+        warehouse_db_name=_warehouse_value(deployment.warehouse_db_name, "database name"),
+        warehouse_db_role=_warehouse_value(deployment.warehouse_db_role, "database role"),
+        warehouse_db_password=decrypt_token(
+            _warehouse_value(deployment.warehouse_db_password_encrypted, "database password")
+        ),
+        warehouse_schema=_warehouse_value(deployment.warehouse_schema, "schema"),
         parameters=deployment.parameters,
     )
+
+
+def _warehouse_value(value: str | None, field: str) -> str:
+    if not value:
+        raise ForeignResourceConflictError(f"Warehouse {field} is not configured for this deployment")
+    return value
 
 
 async def _locked_owned_job(session: AsyncSession, claimed: ClaimedJob) -> ProjectLifecycleJob:

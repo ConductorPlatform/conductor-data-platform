@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import copy
 import hashlib
 import json
 import re
@@ -20,6 +21,7 @@ from app.models.audit_event import AuditEvent
 from app.models.environment import Environment
 from app.models.git_config import GitConfig
 from app.models.project import Project, ProjectLifecycleStatus
+from app.models.project_deployment import ProjectDeployment
 from app.models.project_lifecycle_job import (
     LifecycleJobStatus,
     LifecycleOperation,
@@ -47,7 +49,9 @@ from app.schemas.settings import (
     ProjectSettingsUpdateRequest,
 )
 from app.services.crypto import CredentialsEncryptionNotConfigured, encrypt_token
+from app.services.git_dag_bundle import GitDagBundleSyncError, sync_git_dag_connection
 from app.services.project_access import load_ready_project_for_user
+from app.services.project_airflow_context import ProjectAirflowContext
 from app.services.project_operations import (
     DuplicateProjectSlugError,
     IdempotencyKeyConflictError,
@@ -734,9 +738,10 @@ async def update_git_config(
     await _ensure_admin_access(user, project.id, db)
 
     git_result = await db.execute(
-        select(GitConfig).where(GitConfig.project_id == project.id)
+        select(GitConfig).where(GitConfig.project_id == project.id).with_for_update()
     )
     config = git_result.scalar_one_or_none()
+    previous_config = copy(config) if config is not None else None
     if not config:
         config = GitConfig(project_id=project.id, repo_url="", auth_type="https")
         db.add(config)
@@ -791,8 +796,69 @@ async def update_git_config(
     if config.auth_type == "token" and not config.credentials_encrypted:
         raise HTTPException(status_code=422, detail="Token authentication requires a token")
 
-    await db.commit()
-    await db.refresh(config)
+    # Preserve the exact desired external state before a failed database commit
+    # expires or rolls back the ORM object. It is needed to compensate an
+    # initial create as well as an update of an existing GitConfig row.
+    desired_config = copy(config)
+
+    # Legacy unauthenticated/SSH configurations remain persisted, but only the
+    # token path is an MVP production bundle. Switching away from it revokes
+    # the deterministic connection without attempting to support another mode.
+    deployment: ProjectDeployment | None = None
+    try:
+        if config.auth_type == "token" or previous_auth_type == "token":
+            deployment = (
+                await db.execute(select(ProjectDeployment).where(ProjectDeployment.project_id == project.id))
+            ).scalar_one_or_none()
+            if deployment is None:
+                raise HTTPException(status_code=404, detail="Airflow not provisioned")
+            await sync_git_dag_connection(
+                context=ProjectAirflowContext(
+                    project_id=project.id,
+                    deployment_id=deployment.id,
+                    deployment_generation=deployment.generation,
+                    airflow_base_url=f"http://airflow-{project.id}:8080",
+                    account_key="admin",
+                ),
+                config=config,
+                db=db,
+                previous_config=previous_config,
+            )
+        await db.commit()
+        await db.refresh(config)
+    except GitDagBundleSyncError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=502, detail="Airflow Git connection update failed") from exc
+    except Exception as exc:
+        # External state is applied before the DB transaction. Reconcile to the
+        # locked snapshot after a failed commit, retaining no token if the
+        # helper cannot prove a matched old metadata/token pair.
+        await db.rollback()
+        if deployment is not None:
+            rollback_config = previous_config
+            if rollback_config is None:
+                # A failed initial commit has no persisted counterpart. Remove
+                # both the deterministic Airflow connection and token rather
+                # than leaving a live credential without GitConfig authority.
+                rollback_config = copy(desired_config)
+                rollback_config.auth_type = "https"
+                rollback_config.credentials_encrypted = None
+            try:
+                await sync_git_dag_connection(
+                    context=ProjectAirflowContext(
+                        project_id=project.id,
+                        deployment_id=deployment.id,
+                        deployment_generation=deployment.generation,
+                        airflow_base_url=f"http://airflow-{project.id}:8080",
+                        account_key="admin",
+                    ),
+                    config=rollback_config,
+                    previous_config=desired_config,
+                    db=db,
+                )
+            except GitDagBundleSyncError:
+                pass
+        raise HTTPException(status_code=502, detail="Airflow Git connection update failed") from exc
 
     return GitConfigResponse(
         repo_url=config.repo_url,

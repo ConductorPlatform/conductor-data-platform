@@ -44,6 +44,10 @@ class RuntimeArtifactSpec:
     airflow_viewer_password: str
     airflow_integration_user: str
     airflow_integration_password: str
+    warehouse_db_name: str
+    warehouse_db_role: str
+    warehouse_db_password: str
+    warehouse_schema: str
     parameters: dict[str, object]
 
 
@@ -70,14 +74,26 @@ class RuntimeArtifactWriter:
         airflow_image: str = "conductor-airflow:latest",
         airflow_database_host: str = "host.docker.internal",
         airflow_database_port: int = 5432,
+        warehouse_host: str = "host.docker.internal",
+        warehouse_port: int = 5433,
         template_root: Path = _TEMPLATE_ROOT,
+        secret_root: Path | None = None,
+        artifact_root: Path | None = None,
+        runtime_uid: int = 50000,
+        runtime_gid: int = 0,
     ) -> None:
         self._runtime_root = Path(os.path.abspath(runtime_root))
         self._runtime_ingress_network = runtime_ingress_network
         self._airflow_image = airflow_image
         self._airflow_database_host = airflow_database_host
         self._airflow_database_port = airflow_database_port
+        self._warehouse_host = warehouse_host
+        self._warehouse_port = warehouse_port
         self._template_root = template_root.resolve()
+        self._secret_root = Path(os.path.abspath(secret_root or runtime_root))
+        self._artifact_root = Path(os.path.abspath(artifact_root or runtime_root))
+        self._runtime_uid = runtime_uid
+        self._runtime_gid = runtime_gid
 
     def runtime_directory(self, *, project_id: str, generation: int) -> Path:
         _validate_project_id(project_id)
@@ -89,6 +105,52 @@ class RuntimeArtifactWriter:
             raise ValueError("Runtime artifact path escapes CONDUCTOR_RUNTIME_ROOT") from exc
         return runtime_directory
 
+    def git_token_path(self, *, project_id: str, generation: int) -> Path:
+        """Return the token boundary in the daemon-managed secret volume."""
+
+        return self.secret_directory(project_id=project_id, generation=generation) / "git-token"
+
+    def runtime_subpath(self, *, project_id: str, generation: int) -> str:
+        """Return the only project-scoped volume subpath exposed to a runtime."""
+
+        _validate_project_id(project_id)
+        _validate_generation(generation)
+        return f"{project_id}/{generation}"
+
+    def secret_directory(self, *, project_id: str, generation: int) -> Path:
+        return _ensure_private_generation_directory(
+            self._secret_root, project_id, generation,
+            owner_uid=self._runtime_uid, owner_gid=self._runtime_gid,
+        )
+
+    def artifact_directory(self, *, project_id: str, generation: int) -> Path:
+        return _ensure_private_generation_directory(
+            self._artifact_root, project_id, generation,
+            owner_uid=self._runtime_uid, owner_gid=self._runtime_gid,
+        )
+
+    def write_git_token(self, *, project_id: str, generation: int, token: str) -> Path:
+        """Atomically materialize the Git credential outside Compose and Airflow metadata."""
+
+        if not token or any(character in token for character in ("\x00", "\n", "\r")):
+            raise ValueError("Git token must be a non-empty single-line value")
+        token_path = self.git_token_path(project_id=project_id, generation=generation)
+        _reject_symlink(token_path, "Runtime Git token file")
+        _atomic_write(
+            token_path, token.encode(), owner_uid=self._runtime_uid, owner_gid=self._runtime_gid
+        )
+        return token_path
+
+    def revoke_git_token(self, *, project_id: str, generation: int) -> None:
+        """Remove the private token file without following a hostile symlink."""
+
+        token_path = self.git_token_path(project_id=project_id, generation=generation)
+        _reject_symlink(token_path, "Runtime Git token file")
+        try:
+            token_path.unlink()
+        except FileNotFoundError:
+            return
+
     def render(self, spec: RuntimeArtifactSpec) -> RuntimeArtifact:
         """Render a private, deterministic artifact from trusted desired state only."""
 
@@ -99,6 +161,8 @@ class RuntimeArtifactWriter:
             airflow_image=self._airflow_image,
             airflow_database_host=self._airflow_database_host,
             airflow_database_port=self._airflow_database_port,
+            warehouse_host=self._warehouse_host,
+            warehouse_port=self._warehouse_port,
         )
         runtime_directory = self.runtime_directory(
             project_id=spec.project_id,
@@ -115,6 +179,8 @@ class RuntimeArtifactWriter:
                 airflow_image=self._airflow_image,
                 airflow_database_host=self._airflow_database_host,
                 airflow_database_port=self._airflow_database_port,
+                warehouse_host=self._warehouse_host,
+                warehouse_port=self._warehouse_port,
             )
         ).encode()
 
@@ -123,6 +189,11 @@ class RuntimeArtifactWriter:
             compose_content=compose_content,
             env_content=env_content,
         )
+        # Docker validates `volume.subpath` before starting a container. Create
+        # both roots before any Compose operation so an initially absent token
+        # is represented by an absent file, never a daemon-created directory.
+        self.secret_directory(project_id=spec.project_id, generation=spec.generation)
+        self.artifact_directory(project_id=spec.project_id, generation=spec.generation)
         return RuntimeArtifact(
             project_id=spec.project_id,
             generation=spec.generation,
@@ -181,6 +252,8 @@ def _validate_spec(
     airflow_image: str,
     airflow_database_host: str,
     airflow_database_port: int,
+    warehouse_host: str,
+    warehouse_port: int,
 ) -> None:
     _validate_project_id(spec.project_id)
     _validate_generation(spec.generation)
@@ -192,6 +265,11 @@ def _validate_spec(
         raise ValueError("compose_project_name does not match the immutable project identity")
     if spec.airflow_db_name != expected_database_name or spec.airflow_db_role != expected_database_name:
         raise ValueError("Airflow database identity does not match the immutable project identity")
+    expected_warehouse_name = f"conductor_warehouse_{spec.project_id}"
+    if spec.warehouse_db_name != expected_warehouse_name or spec.warehouse_db_role != expected_warehouse_name:
+        raise ValueError("Warehouse database identity does not match the immutable project identity")
+    if spec.warehouse_schema != "analytics":
+        raise ValueError("Warehouse schema must be the supported analytics schema")
     if not _SLUG_PATTERN.fullmatch(spec.project_slug):
         raise ValueError("project_slug must be a canonical project slug")
 
@@ -200,6 +278,8 @@ def _validate_spec(
     _validate_airflow_image(airflow_image)
     _validate_airflow_database_host(airflow_database_host)
     _validate_airflow_database_port(airflow_database_port)
+    _validate_airflow_database_host(warehouse_host)
+    _validate_airflow_database_port(warehouse_port)
 
     for name, value in _allowlisted_env(
         spec,
@@ -207,6 +287,8 @@ def _validate_spec(
         airflow_image=airflow_image,
         airflow_database_host=airflow_database_host,
         airflow_database_port=airflow_database_port,
+        warehouse_host=warehouse_host,
+        warehouse_port=warehouse_port,
     ).items():
         if not value or "\x00" in value or "\n" in value or "\r" in value:
             raise ValueError(f"{name} must be a non-empty single-line value")
@@ -219,6 +301,8 @@ def _allowlisted_env(
     airflow_image: str,
     airflow_database_host: str,
     airflow_database_port: int,
+    warehouse_host: str,
+    warehouse_port: int,
 ) -> dict[str, str]:
     """Return the only values the static template may interpolate."""
 
@@ -245,6 +329,13 @@ def _allowlisted_env(
         "AIRFLOW_VIEWER_PASSWORD": spec.airflow_viewer_password,
         "AIRFLOW_INTEGRATION_USER": spec.airflow_integration_user,
         "AIRFLOW_INTEGRATION_PASSWORD": spec.airflow_integration_password,
+        "WAREHOUSE_HOST": warehouse_host,
+        "WAREHOUSE_PORT": str(warehouse_port),
+        "WAREHOUSE_DB_NAME": spec.warehouse_db_name,
+        "WAREHOUSE_DB_ROLE": spec.warehouse_db_role,
+        "WAREHOUSE_DB_PASSWORD_URLENCODED": quote(spec.warehouse_db_password, safe=""),
+        "WAREHOUSE_SCHEMA": spec.warehouse_schema,
+        "CONDUCTOR_RUNTIME_SUBPATH": f"{spec.project_id}/{spec.generation}",
     }
 
 
@@ -319,7 +410,42 @@ def _open_private_runtime_root(path: Path) -> int:
     return _open_private_directory(path)
 
 
-def _open_private_child_directory(parent_descriptor: int, name: str) -> int:
+def _ensure_private_generation_directory(
+    root: Path,
+    project_id: str,
+    generation: int,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+) -> Path:
+    """Create a no-follow project/generation directory under one trusted root."""
+
+    _validate_project_id(project_id)
+    _validate_generation(generation)
+    root_descriptor = _open_private_runtime_root(root)
+    try:
+        project_descriptor = _open_private_child_directory(
+            root_descriptor, project_id, owner_uid=owner_uid, owner_gid=owner_gid
+        )
+        try:
+            generation_descriptor = _open_private_child_directory(
+                project_descriptor, str(generation), owner_uid=owner_uid, owner_gid=owner_gid
+            )
+        finally:
+            os.close(project_descriptor)
+    finally:
+        os.close(root_descriptor)
+    os.close(generation_descriptor)
+    return root / project_id / str(generation)
+
+
+def _open_private_child_directory(
+    parent_descriptor: int,
+    name: str,
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+) -> int:
     try:
         os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
     except FileExistsError:
@@ -332,7 +458,10 @@ def _open_private_child_directory(parent_descriptor: int, name: str) -> int:
         raise ValueError("Runtime artifact path component must not be a symlink")
     if not stat.S_ISDIR(child_stat.st_mode):
         raise ValueError("Runtime artifact path component must be a directory")
-    return _open_private_directory(name, dir_fd=parent_descriptor)
+    descriptor = _open_private_directory(name, dir_fd=parent_descriptor)
+    if owner_uid is not None and owner_gid is not None:
+        _set_runtime_owner(descriptor, owner_uid, owner_gid)
+    return descriptor
 
 
 def _open_private_directory(path: str | Path, *, dir_fd: int | None = None) -> int:
@@ -351,7 +480,13 @@ def _open_private_directory(path: str | Path, *, dir_fd: int | None = None) -> i
     return descriptor
 
 
-def _atomic_write(destination: Path, content: bytes) -> None:
+def _atomic_write(
+    destination: Path,
+    content: bytes,
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+) -> None:
     temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
     try:
         with temporary.open("xb", buffering=0) as file_handle:
@@ -361,6 +496,8 @@ def _atomic_write(destination: Path, content: bytes) -> None:
             os.fsync(file_handle.fileno())
         os.replace(temporary, destination)
         os.chmod(destination, 0o600)
+        if owner_uid is not None and owner_gid is not None:
+            _set_runtime_owner_path(destination, owner_uid, owner_gid)
         _fsync_directory(destination.parent)
     finally:
         if temporary.exists():
@@ -373,6 +510,25 @@ def _fsync_directory(directory: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _set_runtime_owner(descriptor: int, uid: int, gid: int) -> None:
+    """Make project volume subpaths readable by the fixed Airflow identity.
+
+    The lifecycle worker runs as root. Unit tests run as an unprivileged user,
+    so they preserve their temporary-file ownership while exercising the same
+    no-follow and mode semantics.
+    """
+
+    if os.geteuid() == 0:
+        os.fchown(descriptor, uid, gid)
+    os.fchmod(descriptor, 0o700)
+
+
+def _set_runtime_owner_path(path: Path, uid: int, gid: int) -> None:
+    if os.geteuid() == 0:
+        os.chown(path, uid, gid, follow_symlinks=False)
+    os.chmod(path, 0o600)
 
 
 def _publish_generation_atomically(

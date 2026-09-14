@@ -1,25 +1,34 @@
 """
 Conductor — example dbt DAG for Airflow 3.x.
 
-This DAG runs dbt models in production after a developer merges
-their feature branch to main. The dbt invocation uses the manifest
-generated during development.
-
-Requirements:
-  - dbt-core 2.0.0a4 installed on the worker
-  - A dbt project exists at /opt/airflow/dags/dbt_project/
-  - The dbt profiles.yml is configured for the target warehouse
+This DAG runs dbt models from the same immutable GitDagBundle version as
+the DAG itself. The Git connection supplies the production ref and safe
+repository-relative paths; no mutable IDE workspace is used.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
+from shlex import quote
 
 from airflow.sdk import DAG
 from airflow.providers.standard.operators.bash import BashOperator
+from conductor_git_bundle import dbt_project_dir
 
-DBT_PROJECT_DIR = "/opt/airflow/dags/dbt_project"
-DBT_PROFILES_DIR = "/opt/airflow/dags/dbt_project/profiles"
+DBT_PROJECT_DIR = dbt_project_dir(__file__)
+DBT_PROFILES_DIR = f"{DBT_PROJECT_DIR}/profiles"
+DBT_ARTIFACT_ROOT = "/opt/airflow/conductor-dbt-artifacts"
+
+
+def _dbt_command() -> str:
+    """Delegate bounded capture to the installed, fixed-argument helper."""
+
+    return (
+        f"CONDUCTOR_DBT_PROJECT_DIR={quote(DBT_PROJECT_DIR)} "
+        f"CONDUCTOR_DBT_PROFILES_DIR={quote(DBT_PROFILES_DIR)} "
+        f"CONDUCTOR_DBT_ARTIFACT_ROOT={quote(DBT_ARTIFACT_ROOT)} "
+        "python /opt/airflow/plugins/conductor_dbt_artifacts.py"
+    )
 
 
 with DAG(
@@ -35,19 +44,5 @@ with DAG(
 
     dbt_run = BashOperator(
         task_id="dbt_run",
-        bash_command=(
-            f"cd {DBT_PROJECT_DIR} && "
-            f"dbt deps --profiles-dir {DBT_PROFILES_DIR} && "
-            f"dbt run --profiles-dir {DBT_PROFILES_DIR}"
-        ),
+        bash_command=_dbt_command(),
     )
-
-    dbt_test = BashOperator(
-        task_id="dbt_test",
-        bash_command=(
-            f"cd {DBT_PROJECT_DIR} && "
-            f"dbt test --profiles-dir {DBT_PROFILES_DIR}"
-        ),
-    )
-
-    dbt_run >> dbt_test
