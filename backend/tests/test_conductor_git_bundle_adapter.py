@@ -125,8 +125,58 @@ def test_dbt_project_dir_rejects_a_symlinked_dags_path_outside_the_bundle(tmp_pa
     (outside_dags / "run.py").write_text("# synthetic DAG\n")
     (repository / "dags").symlink_to(outside_dags, target_is_directory=True)
 
-    with pytest.raises(ValueError, match="DAG path escapes"):
+    with pytest.raises(ValueError, match="not a regular bundle file"):
         module.dbt_project_dir(str(repository / "dags" / "run.py"))
+
+
+def test_dbt_project_dir_rejects_an_intermediate_symlink_to_an_outside_checkout(tmp_path) -> None:
+    class Connection:
+        extra_dejson = {
+            "conductor_tracking_ref": "production",
+            "conductor_dags_path": "orchestration/link/dags",
+            "conductor_dbt_path": "orchestration/link/dbt",
+        }
+
+    module = _load_bundle_module(Connection())
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    outside = tmp_path / "outside"
+    (outside / ".git").mkdir(parents=True)
+    dag_file = outside / "dags" / "nested" / "run.py"
+    dag_file.parent.mkdir(parents=True)
+    dag_file.write_text("# synthetic DAG\n")
+    (outside / "dbt").mkdir()
+    (outside / "dbt" / "dbt_project.yml").write_text("name: synthetic\n")
+    orchestration = repository / "orchestration"
+    orchestration.mkdir()
+    (orchestration / "link").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="not a regular bundle file"):
+        module.dbt_project_dir(str(orchestration / "link" / "dags" / "nested" / "run.py"))
+
+
+def test_dbt_project_dir_rejects_a_symlinked_dbt_project_file(tmp_path) -> None:
+    class Connection:
+        extra_dejson = {
+            "conductor_tracking_ref": "production",
+            "conductor_dags_path": "dags",
+            "conductor_dbt_path": "dbt",
+        }
+
+    module = _load_bundle_module(Connection())
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+    dag_file = repository / "dags" / "nested" / "run.py"
+    dag_file.parent.mkdir(parents=True)
+    dag_file.write_text("# synthetic DAG\n")
+    project_directory = repository / "dbt"
+    project_directory.mkdir()
+    outside_project = tmp_path / "outside-project.yml"
+    outside_project.write_text("name: outside\n")
+    (project_directory / "dbt_project.yml").symlink_to(outside_project)
+
+    with pytest.raises(ValueError, match="dbt project is missing"):
+        module.dbt_project_dir(str(dag_file))
 
 
 def test_dbt_project_dir_resolves_valid_dags_and_dbt_paths_in_the_same_bundle(tmp_path) -> None:

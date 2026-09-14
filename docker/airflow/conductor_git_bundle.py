@@ -148,6 +148,23 @@ class ConductorGitDagBundle(GitDagBundle):
         super().refresh()
 
 
+def _has_symlinked_component(path: Path) -> bool:
+    """Return whether a lexical path component is a symlink without resolving it.
+
+    ``Path.lstat`` on a descendant alone follows symlinked ancestors.  Walking
+    each component is therefore required before a checkout marker discovered
+    below that descendant can be trusted.
+    """
+
+    absolute_path = path.absolute()
+    current = Path(absolute_path.anchor)
+    for component in absolute_path.parts[1:]:
+        current /= component
+        if stat.S_ISLNK(current.lstat().st_mode):
+            return True
+    return False
+
+
 def bundle_repository_root(dag_file: str) -> Path:
     """Find the native bundle checkout without relying on DAG path depth.
 
@@ -157,7 +174,7 @@ def bundle_repository_root(dag_file: str) -> Path:
     """
 
     dag_path = Path(dag_file)
-    if dag_path.is_symlink() or not dag_path.is_file():
+    if _has_symlinked_component(dag_path) or not dag_path.is_file():
         raise ValueError("Conductor DAG file is not a regular bundle file")
     for candidate in (dag_path.parent, *dag_path.parents):
         marker = candidate / ".git"
@@ -167,9 +184,9 @@ def bundle_repository_root(dag_file: str) -> Path:
             continue
         if marker.is_symlink() or not (stat.S_ISDIR(marker_stat.st_mode) or stat.S_ISREG(marker_stat.st_mode)):
             raise ValueError("Conductor Git bundle has an unsafe repository marker")
-        root = candidate.resolve()
-        if root == candidate or not candidate.is_symlink():
-            return root
+        # The full lexical path to the DAG was checked above.  This marker is
+        # consequently in the same non-symlinked materialized checkout.
+        return candidate.resolve()
     raise ValueError("Conductor DAG file is not inside an immutable Git bundle")
 
 
@@ -197,6 +214,16 @@ def dbt_project_dir(dag_file: str, *, git_conn_id: str = _CONNECTION_ID) -> str:
         project_dir.relative_to(repository_root)
     except ValueError as exc:
         raise ValueError("Conductor dbt path escapes the immutable Git bundle") from exc
-    if not project_dir.is_dir() or not (project_dir / "dbt_project.yml").is_file():
+    project_file = project_dir / "dbt_project.yml"
+    try:
+        project_file_stat = project_file.lstat()
+        project_file.resolve(strict=True).relative_to(repository_root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError("Conductor dbt project is missing from the immutable Git bundle") from exc
+    if (
+        not project_dir.is_dir()
+        or project_file.is_symlink()
+        or not stat.S_ISREG(project_file_stat.st_mode)
+    ):
         raise ValueError("Conductor dbt project is missing from the immutable Git bundle")
     return str(project_dir)
