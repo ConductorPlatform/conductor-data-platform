@@ -22,6 +22,12 @@ class RunnerNotConfiguredError(PermanentLifecycleError):
     code = "RUNNER_NOT_CONFIGURED"
 
 
+class WarehouseMaintenanceConfigurationError(PermanentLifecycleError):
+    """The isolated warehouse cannot safely fall back to a metadata database."""
+
+    code = "WAREHOUSE_MAINTENANCE_DSN_REQUIRED"
+
+
 class LifecycleRunnerRegistry:
     """Explicit registry that enables only trusted operation implementations."""
 
@@ -48,12 +54,15 @@ def build_default_registry() -> LifecycleRunnerRegistry:
     maintenance_dsn = settings.lifecycle_maintenance_database_dsn or settings.database_url.replace(
         "postgresql+asyncpg://", "postgresql://", 1
     )
+    warehouse_maintenance_dsn = settings.lifecycle_warehouse_maintenance_dsn
+    if not warehouse_maintenance_dsn:
+        raise WarehouseMaintenanceConfigurationError(
+            "A separate lifecycle warehouse maintenance DSN must be configured"
+        )
     provisioner = build_compose_provisioner(
         async_session_factory,
         database_manager=AsyncpgProjectDatabaseManager(maintenance_dsn),
-        warehouse_manager=ProjectWarehouseManager(
-            settings.lifecycle_warehouse_maintenance_dsn or maintenance_dsn
-        ),
+        warehouse_manager=ProjectWarehouseManager(warehouse_maintenance_dsn),
         runtime_root=settings.lifecycle_runtime_root,
         runtime_ingress_network=settings.lifecycle_runtime_ingress_network,
         airflow_image=settings.lifecycle_airflow_image,
