@@ -127,7 +127,7 @@ async def create_project_operation(
             project.slug,
             settings.airflow_external_domain,
         )
-        plaintext_credentials = [secrets.token_urlsafe(32) for _ in range(5)]
+        plaintext_credentials = [secrets.token_urlsafe(32) for _ in range(6)]
         encrypted_credentials = [encrypt_token(value) for value in plaintext_credentials]
         deployment = ProjectDeployment(
             project_id=project.id,
@@ -147,6 +147,10 @@ async def create_project_operation(
             airflow_viewer_password_encrypted=encrypted_credentials[3],
             airflow_integration_user="integration",
             airflow_integration_password_encrypted=encrypted_credentials[4],
+            warehouse_db_name=f"conductor_warehouse_{project.id}",
+            warehouse_db_role=f"conductor_warehouse_{project.id}",
+            warehouse_db_password_encrypted=encrypted_credentials[5],
+            warehouse_schema="analytics",
             parameters=validate_runtime_parameters({}),
         )
         db.add(deployment)

@@ -53,6 +53,12 @@ class ProjectDeployment(Base):
     airflow_viewer_password_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     airflow_integration_user: Mapped[str] = mapped_column(String(128), nullable=False)
     airflow_integration_password_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    # Legacy deployments remain inspectable/retriable.  New deployments always
+    # set these deterministic, private warehouse values.
+    warehouse_db_name: Mapped[str | None] = mapped_column(String(63), nullable=True, unique=True)
+    warehouse_db_role: Mapped[str | None] = mapped_column(String(63), nullable=True, unique=True)
+    warehouse_db_password_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    warehouse_schema: Mapped[str | None] = mapped_column(String(63), nullable=True)
     parameters: Mapped[dict] = mapped_column(
         JSONB,
         nullable=False,

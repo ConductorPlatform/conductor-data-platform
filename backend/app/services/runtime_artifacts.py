@@ -44,6 +44,10 @@ class RuntimeArtifactSpec:
     airflow_viewer_password: str
     airflow_integration_user: str
     airflow_integration_password: str
+    warehouse_db_name: str
+    warehouse_db_role: str
+    warehouse_db_password: str
+    warehouse_schema: str
     parameters: dict[str, object]
 
 
@@ -70,6 +74,8 @@ class RuntimeArtifactWriter:
         airflow_image: str = "conductor-airflow:latest",
         airflow_database_host: str = "host.docker.internal",
         airflow_database_port: int = 5432,
+        warehouse_host: str = "host.docker.internal",
+        warehouse_port: int = 5433,
         template_root: Path = _TEMPLATE_ROOT,
     ) -> None:
         self._runtime_root = Path(os.path.abspath(runtime_root))
@@ -77,6 +83,8 @@ class RuntimeArtifactWriter:
         self._airflow_image = airflow_image
         self._airflow_database_host = airflow_database_host
         self._airflow_database_port = airflow_database_port
+        self._warehouse_host = warehouse_host
+        self._warehouse_port = warehouse_port
         self._template_root = template_root.resolve()
 
     def runtime_directory(self, *, project_id: str, generation: int) -> Path:
@@ -99,6 +107,8 @@ class RuntimeArtifactWriter:
             airflow_image=self._airflow_image,
             airflow_database_host=self._airflow_database_host,
             airflow_database_port=self._airflow_database_port,
+            warehouse_host=self._warehouse_host,
+            warehouse_port=self._warehouse_port,
         )
         runtime_directory = self.runtime_directory(
             project_id=spec.project_id,
@@ -115,6 +125,8 @@ class RuntimeArtifactWriter:
                 airflow_image=self._airflow_image,
                 airflow_database_host=self._airflow_database_host,
                 airflow_database_port=self._airflow_database_port,
+                warehouse_host=self._warehouse_host,
+                warehouse_port=self._warehouse_port,
             )
         ).encode()
 
@@ -181,6 +193,8 @@ def _validate_spec(
     airflow_image: str,
     airflow_database_host: str,
     airflow_database_port: int,
+    warehouse_host: str,
+    warehouse_port: int,
 ) -> None:
     _validate_project_id(spec.project_id)
     _validate_generation(spec.generation)
@@ -192,6 +206,11 @@ def _validate_spec(
         raise ValueError("compose_project_name does not match the immutable project identity")
     if spec.airflow_db_name != expected_database_name or spec.airflow_db_role != expected_database_name:
         raise ValueError("Airflow database identity does not match the immutable project identity")
+    expected_warehouse_name = f"conductor_warehouse_{spec.project_id}"
+    if spec.warehouse_db_name != expected_warehouse_name or spec.warehouse_db_role != expected_warehouse_name:
+        raise ValueError("Warehouse database identity does not match the immutable project identity")
+    if spec.warehouse_schema != "analytics":
+        raise ValueError("Warehouse schema must be the supported analytics schema")
     if not _SLUG_PATTERN.fullmatch(spec.project_slug):
         raise ValueError("project_slug must be a canonical project slug")
 
@@ -200,6 +219,8 @@ def _validate_spec(
     _validate_airflow_image(airflow_image)
     _validate_airflow_database_host(airflow_database_host)
     _validate_airflow_database_port(airflow_database_port)
+    _validate_airflow_database_host(warehouse_host)
+    _validate_airflow_database_port(warehouse_port)
 
     for name, value in _allowlisted_env(
         spec,
@@ -207,6 +228,8 @@ def _validate_spec(
         airflow_image=airflow_image,
         airflow_database_host=airflow_database_host,
         airflow_database_port=airflow_database_port,
+        warehouse_host=warehouse_host,
+        warehouse_port=warehouse_port,
     ).items():
         if not value or "\x00" in value or "\n" in value or "\r" in value:
             raise ValueError(f"{name} must be a non-empty single-line value")
@@ -219,6 +242,8 @@ def _allowlisted_env(
     airflow_image: str,
     airflow_database_host: str,
     airflow_database_port: int,
+    warehouse_host: str,
+    warehouse_port: int,
 ) -> dict[str, str]:
     """Return the only values the static template may interpolate."""
 
@@ -245,6 +270,12 @@ def _allowlisted_env(
         "AIRFLOW_VIEWER_PASSWORD": spec.airflow_viewer_password,
         "AIRFLOW_INTEGRATION_USER": spec.airflow_integration_user,
         "AIRFLOW_INTEGRATION_PASSWORD": spec.airflow_integration_password,
+        "WAREHOUSE_HOST": warehouse_host,
+        "WAREHOUSE_PORT": str(warehouse_port),
+        "WAREHOUSE_DB_NAME": spec.warehouse_db_name,
+        "WAREHOUSE_DB_ROLE": spec.warehouse_db_role,
+        "WAREHOUSE_DB_PASSWORD_URLENCODED": quote(spec.warehouse_db_password, safe=""),
+        "WAREHOUSE_SCHEMA": spec.warehouse_schema,
     }
 
 

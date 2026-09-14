@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     lifecycle_airflow_database_host: str = "host.docker.internal"
     lifecycle_airflow_database_port: int = Field(default=5432, ge=1, le=65535)
     lifecycle_maintenance_database_dsn: str | None = None
+    lifecycle_warehouse_maintenance_dsn: str | None = None
+    lifecycle_warehouse_host: str = "host.docker.internal"
+    lifecycle_warehouse_port: int = Field(default=5433, ge=1, le=65535)
     lifecycle_airflow_ready_timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
     lifecycle_airflow_ready_poll_seconds: float = Field(default=2.0, gt=0, allow_inf_nan=False)
 
