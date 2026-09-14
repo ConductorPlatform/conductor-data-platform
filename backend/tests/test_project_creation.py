@@ -78,7 +78,7 @@ async def test_create_project_returns_202_and_persists_atomic_operation(
     caplog,
 ):
     monkeypatch.setattr(settings, "credentials_encryption_key", "task-four-test-key-material-32-bytes")
-    generated_plaintexts = [f"task-four-fake-credential-{index}" for index in range(5)]
+    generated_plaintexts = [f"task-four-fake-credential-{index}" for index in range(6)]
     generated = iter(generated_plaintexts)
     monkeypatch.setattr(secrets, "token_urlsafe", lambda _size: next(generated))
     idempotency_key = str(uuid4())
@@ -148,9 +148,13 @@ async def test_create_project_returns_202_and_persists_atomic_operation(
         deployment.airflow_dev_password_encrypted,
         deployment.airflow_viewer_password_encrypted,
         deployment.airflow_integration_password_encrypted,
+        deployment.warehouse_db_password_encrypted,
     ]
     assert all(value.startswith("gAAAA") for value in encrypted_values)
     assert all(plaintext not in encrypted for plaintext in generated_plaintexts for encrypted in encrypted_values)
+    assert deployment.warehouse_db_name == f"conductor_warehouse_{project.id}"
+    assert deployment.warehouse_db_role == f"conductor_warehouse_{project.id}"
+    assert deployment.warehouse_schema == "analytics"
 
     operation = (
         await db_session.execute(
@@ -306,7 +310,7 @@ async def test_create_project_same_key_replays_original_response_without_realloc
 
     assert first.status_code == replay.status_code == 202
     assert replay.json() == first.json()
-    assert generated_count == 5
+    assert generated_count == 6
     assert await db_session.scalar(select(func.count()).select_from(Project)) == 1
     assert await db_session.scalar(select(func.count()).select_from(ProjectDeployment)) == 1
     assert await db_session.scalar(select(func.count()).select_from(ProjectLifecycleJob)) == 1
@@ -446,7 +450,7 @@ async def test_create_project_concurrent_same_key_returns_one_operation(
     assert await db_session.scalar(select(func.count()).select_from(ProjectDeployment)) == 1
     assert await db_session.scalar(select(func.count()).select_from(ProjectLifecycleJob)) == 1
     assert await db_session.scalar(select(func.count()).select_from(AuditEvent)) == 1
-    assert generated_count == 5
+    assert generated_count == 6
 
 
 @pytest.mark.asyncio
@@ -496,7 +500,7 @@ async def test_create_project_concurrent_different_body_returns_one_generic_conf
     }
     assert accepted.json()["project"]["id"] not in conflict.text
     assert accepted.json()["operation"]["id"] not in conflict.text
-    assert generated_count == 5
+    assert generated_count == 6
     assert await db_session.scalar(select(func.count()).select_from(Project)) == 1
     assert await db_session.scalar(select(func.count()).select_from(AuditEvent)) == 1
 

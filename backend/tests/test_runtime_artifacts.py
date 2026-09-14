@@ -25,6 +25,7 @@ FIXTURE_SECRETS = (
     "fixture-airflow-dev-password",
     "fixture-airflow-viewer-password",
     "fixture-airflow-integration-password",
+    "fixture-warehouse-password:/?#[]!$&'()*+,;=%%",
 )
 TEMPLATE_PATH = Path(__file__).resolve().parents[1] / "app/runtime_templates/v1/compose.yaml"
 ENV_FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures/runtime-v1.env"
@@ -50,6 +51,10 @@ def runtime_spec() -> RuntimeArtifactSpec:
         airflow_viewer_password=FIXTURE_SECRETS[3],
         airflow_integration_user="integration",
         airflow_integration_password=FIXTURE_SECRETS[4],
+        warehouse_db_name=f"conductor_warehouse_{PROJECT_ID}",
+        warehouse_db_role=f"conductor_warehouse_{PROJECT_ID}",
+        warehouse_db_password=FIXTURE_SECRETS[5],
+        warehouse_schema="analytics",
         parameters={},
     )
 
