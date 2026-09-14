@@ -59,8 +59,8 @@ async def test_git_token_is_encrypted_and_never_returned(
             "auth_type": "token",
             "token": plaintext_token,
             "default_branch": "main",
-            "dbt_path": "dbt/",
-            "dags_path": "dags/",
+            "dbt_path": "dbt",
+            "dags_path": "dags",
         },
     )
 

@@ -108,6 +108,31 @@ def test_runtime_root_and_artifact_directories_are_private(tmp_path: Path, runti
     assert stat.S_IMODE(artifact.runtime_directory.stat().st_mode) == 0o700
 
 
+def test_runtime_git_token_is_private_and_rejects_symlink_escape(
+    tmp_path: Path, runtime_spec: RuntimeArtifactSpec
+) -> None:
+    writer = RuntimeArtifactWriter(runtime_root=tmp_path)
+    artifact = writer.render(runtime_spec)
+
+    token_path = writer.write_git_token(
+        project_id=runtime_spec.project_id,
+        generation=runtime_spec.generation,
+        token="test-git-token",
+    )
+
+    assert token_path.parent == artifact.runtime_directory
+    assert token_path.read_text() == "test-git-token"
+    assert stat.S_IMODE(token_path.stat().st_mode) == 0o600
+    token_path.unlink()
+    token_path.symlink_to(tmp_path / "outside-token")
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        writer.write_git_token(
+            project_id=runtime_spec.project_id,
+            generation=runtime_spec.generation,
+            token="another-token",
+        )
+
+
 @pytest.mark.parametrize("symlink_component", ["runtime-root", "project-id", "generation"])
 def test_runtime_artifacts_reject_preseeded_symlink_components(
     tmp_path: Path,

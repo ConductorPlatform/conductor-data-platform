@@ -22,6 +22,7 @@ from airflow.providers.git.hooks.git import GitHook
 
 _CONNECTION_ID = "conductor_git"
 _REQUIRED_EXTRA_KEYS = frozenset({"conductor_tracking_ref", "conductor_dags_path", "conductor_dbt_path"})
+_TOKEN_FILE = Path("/run/secrets/conductor-git-token")
 
 
 def _connection_metadata(connection_id: str) -> tuple[str, str, str]:
@@ -47,16 +48,21 @@ class ConductorGitHook(GitHook):
 
     @contextmanager
     def configure_hook_env(self) -> Iterator[None]:
-        if not self.auth_token or not isinstance(self.repo_url, str) or not self.repo_url.startswith("https://"):
+        if not isinstance(self.repo_url, str) or not self.repo_url.startswith("https://"):
             with super().configure_hook_env():
                 yield
             return
 
+        try:
+            token_stat = _TOKEN_FILE.stat()
+        except FileNotFoundError as exc:
+            raise ValueError("Conductor Git token file is unavailable") from exc
+        if not stat.S_ISREG(token_stat.st_mode) or token_stat.st_mode & 0o077:
+            raise ValueError("Conductor Git token file is not private")
+
         with tempfile.TemporaryDirectory(prefix="conductor-git-") as directory:
             root = Path(directory)
-            token_file = root / "token"
             askpass_file = root / "askpass"
-            token_file.write_text(self.auth_token)
             askpass_file.write_text(
                 "#!/bin/sh\n"
                 "case \"$1\" in\n"
@@ -65,21 +71,26 @@ class ConductorGitHook(GitHook):
                 "  *) exit 1 ;;\n"
                 "esac\n"
             )
-            os.chmod(token_file, stat.S_IRUSR | stat.S_IWUSR)
             os.chmod(askpass_file, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
             previous = dict(self.env)
-            self.env.update(
-                {
-                    "CONDUCTOR_GIT_TOKEN_FILE": str(token_file),
-                    "CONDUCTOR_GIT_USERNAME": self.user_name,
-                    "GIT_ASKPASS": str(askpass_file),
-                    "GIT_TERMINAL_PROMPT": "0",
-                }
-            )
+            environment = {
+                "CONDUCTOR_GIT_TOKEN_FILE": str(_TOKEN_FILE),
+                "CONDUCTOR_GIT_USERNAME": self.user_name or "oauth2",
+                "GIT_ASKPASS": str(askpass_file),
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+            previous_process_environment = {key: os.environ.get(key) for key in environment}
+            self.env.update(environment)
+            os.environ.update(environment)
             try:
                 yield
             finally:
                 self.env = previous
+                for key, previous_value in previous_process_environment.items():
+                    if previous_value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = previous_value
 
 
 class ConductorGitDagBundle(GitDagBundle):

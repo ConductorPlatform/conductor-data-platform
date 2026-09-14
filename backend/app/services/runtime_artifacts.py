@@ -97,6 +97,36 @@ class RuntimeArtifactWriter:
             raise ValueError("Runtime artifact path escapes CONDUCTOR_RUNTIME_ROOT") from exc
         return runtime_directory
 
+    def git_token_path(self, *, project_id: str, generation: int) -> Path:
+        """Return the private token-file boundary for an existing runtime."""
+
+        runtime_directory = self.runtime_directory(project_id=project_id, generation=generation)
+        self._ensure_private_project_directory(project_id)
+        _reject_symlink(runtime_directory, "Runtime artifact generation")
+        if not runtime_directory.is_dir():
+            raise ValueError("Runtime artifact generation is not available")
+        return runtime_directory / "git-token"
+
+    def write_git_token(self, *, project_id: str, generation: int, token: str) -> Path:
+        """Atomically materialize the Git credential outside Compose and Airflow metadata."""
+
+        if not token or "\x00" in token:
+            raise ValueError("Git token must be a non-empty single-line value")
+        token_path = self.git_token_path(project_id=project_id, generation=generation)
+        _reject_symlink(token_path, "Runtime Git token file")
+        _atomic_write(token_path, token.encode())
+        return token_path
+
+    def revoke_git_token(self, *, project_id: str, generation: int) -> None:
+        """Remove the private token file without following a hostile symlink."""
+
+        token_path = self.git_token_path(project_id=project_id, generation=generation)
+        _reject_symlink(token_path, "Runtime Git token file")
+        try:
+            token_path.unlink()
+        except FileNotFoundError:
+            return
+
     def render(self, spec: RuntimeArtifactSpec) -> RuntimeArtifact:
         """Render a private, deterministic artifact from trusted desired state only."""
 
