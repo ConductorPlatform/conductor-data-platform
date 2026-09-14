@@ -12,8 +12,12 @@ from urllib.parse import urlsplit, urlunsplit
 import asyncpg
 
 from app.models.project_deployment import ProjectDeployment
+from app.services.crypto import decrypt_token
 from app.services.lifecycle_errors import ForeignResourceConflictError
-from app.services.project_database import AsyncpgProjectDatabaseManager, ProjectDatabaseManager
+from app.services.project_database import (
+    AsyncpgProjectDatabaseManager,
+    ProjectDatabaseManager,
+)
 
 _PROJECT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SCHEMA_QUERY = """
@@ -24,6 +28,7 @@ _SCHEMA_QUERY = """
     WHERE namespace.nspname = $1
 """
 Connect = Callable[[str], Awaitable[asyncpg.Connection]]
+Decrypt = Callable[[str], str]
 
 
 def _required(value: str | None, field: str) -> str:
@@ -53,11 +58,15 @@ class ProjectWarehouseManager:
         *,
         connect: Connect = asyncpg.connect,
         database_manager: ProjectDatabaseManager | None = None,
+        decrypt: Decrypt = decrypt_token,
     ) -> None:
         self._maintenance_dsn = maintenance_dsn
         self._connect = connect
         self._database_manager = database_manager or AsyncpgProjectDatabaseManager(
-            maintenance_dsn, connect=connect
+            maintenance_dsn,
+            connect=connect,
+            decrypt=decrypt,
+            resource_kind="warehouse",
         )
 
     @staticmethod

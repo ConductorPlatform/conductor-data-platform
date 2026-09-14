@@ -63,16 +63,19 @@ class AsyncpgProjectDatabaseManager:
         *,
         connect: Connect = asyncpg.connect,
         decrypt: Decrypt = decrypt_token,
+        resource_kind: Literal["airflow", "warehouse"] = "airflow",
     ) -> None:
+        if resource_kind not in {"airflow", "warehouse"}:
+            raise ValueError("resource_kind must be airflow or warehouse")
         self._maintenance_dsn = maintenance_dsn
         self._connect = connect
         self._decrypt = decrypt
+        self._resource_kind = resource_kind
 
-    @staticmethod
-    def _validate(deployment: ProjectDeployment) -> None:
+    def _validate(self, deployment: ProjectDeployment) -> None:
         if not _PROJECT_ID_RE.fullmatch(deployment.project_id):
             raise ValueError("project_id must be exactly 32 lowercase hexadecimal characters")
-        expected = f"conductor_airflow_{deployment.project_id}"
+        expected = f"conductor_{self._resource_kind}_{deployment.project_id}"
         for field in ("airflow_db_name", "airflow_db_role"):
             if getattr(deployment, field) != expected:
                 raise ValueError(f"{field} must equal the deterministic project database identity")
@@ -85,9 +88,10 @@ class AsyncpgProjectDatabaseManager:
     def _ownership_comment(project_id: str) -> str:
         return f"conductor.project_id={project_id}"
 
-    @staticmethod
-    def _lock_identity(project_id: str) -> str:
-        return f"conductor.project_database:{project_id}"
+    def _lock_identity(self, project_id: str) -> str:
+        if self._resource_kind == "airflow":
+            return f"conductor.project_database:{project_id}"
+        return f"conductor.project_warehouse_database:{project_id}"
 
     @asynccontextmanager
     async def _fenced_connection(
@@ -246,6 +250,12 @@ class AsyncpgProjectDatabaseManager:
                     raise ForeignResourceConflictError(
                         "Created PostgreSQL database ownership could not be proven after comment"
                     )
+
+            # PostgreSQL grants CONNECT to PUBLIC by default. Explicitly revoke
+            # it on every convergence so only the owning project role can open
+            # this project-scoped database.
+            database_identifier = self._quote_identifier(deployment.airflow_db_name)
+            await connection.execute(f"REVOKE CONNECT ON DATABASE {database_identifier} FROM PUBLIC")
 
             return ObservedDatabaseResource(
                 kind="database",

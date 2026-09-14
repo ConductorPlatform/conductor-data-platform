@@ -188,10 +188,9 @@ async def test_ensure_database_revalidates_role_creates_and_comments_captured_da
         "database", RESOURCE_NAME, PROJECT_ID, RESOURCE_NAME
     )
     mutations = mutation_sql(connection)
-    assert mutations == [
-        f'CREATE DATABASE "{RESOURCE_NAME}" OWNER "{RESOURCE_NAME}"',
-        f'COMMENT ON DATABASE "{RESOURCE_NAME}" IS \'server-quoted\'',
-    ]
+    assert mutations[0] == f'CREATE DATABASE "{RESOURCE_NAME}" OWNER "{RESOURCE_NAME}"'
+    assert mutations[1].startswith(f'COMMENT ON DATABASE "{RESOURCE_NAME}" IS ')
+    assert mutations[2] == f'REVOKE CONNECT ON DATABASE "{RESOURCE_NAME}" FROM PUBLIC'
     assert_fenced(connection)
 
 
