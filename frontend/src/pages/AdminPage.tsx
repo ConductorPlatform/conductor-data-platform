@@ -76,7 +76,6 @@ function statusBadge(status: string) {
 
 function UsersTable() {
   const [users, setUsers] = useState<User[]>([]);
-  const [editingId, setEditingId] = useState<string | null>(null);
 
   useEffect(() => {
     apiFetch('/admin/users').then(setUsers).catch(() => setUsers([]));

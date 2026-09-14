@@ -8,19 +8,19 @@ const mockWorkspace = { branch: 'feature/new-model', ahead: 3, behind: 0, files:
 
 describe('DevPage', () => {
   beforeAll(() => {
-    window.fetch = vi.fn((url: string, init?: any) => {
-      const urlStr = String(url);
+    window.fetch = vi.fn((input: RequestInfo | URL) => {
+      const urlStr = String(input);
       if (urlStr.includes('/setup-workspace')) {
-        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ message: 'ok' }) });
+        return Promise.resolve(Response.json({ message: 'ok' }));
       }
       if (urlStr.includes('/token')) {
-        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockToken) });
+        return Promise.resolve(Response.json(mockToken));
       }
       if (urlStr.includes('/workspace-info')) {
-        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(mockWorkspace) });
+        return Promise.resolve(Response.json(mockWorkspace));
       }
-      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
-    });
+      return Promise.resolve(Response.json({}));
+    }) as typeof fetch;
   });
 
   afterAll(() => {
