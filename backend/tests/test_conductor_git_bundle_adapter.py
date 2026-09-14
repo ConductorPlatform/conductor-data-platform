@@ -120,7 +120,8 @@ def test_dbt_project_dir_resolves_valid_dags_and_dbt_paths_in_the_same_bundle(tm
     (repository / ".git").mkdir(parents=True)
     dag_directory = repository / "orchestration" / "dags"
     dag_directory.mkdir(parents=True)
-    dag_file = dag_directory / "run.py"
+    dag_file = dag_directory / "nested" / "more" / "run.py"
+    dag_file.parent.mkdir(parents=True)
     dag_file.write_text("# synthetic DAG\n")
     dbt_directory = repository / "transform" / "dbt"
     dbt_directory.mkdir(parents=True)

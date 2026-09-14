@@ -100,6 +100,9 @@ services:
       - ./backend/tests:/app/tests  # test files
       - ./backend/pyproject.toml:/app/pyproject.toml  # for pytest config
       - ./workspaces:/workspace  # shared with code-server
+      # Git settings updates run in FastAPI; this is the same daemon volume
+      # mounted read-only and subpath-scoped by each project Airflow runtime.
+      - conductor-runtime-secrets:/var/lib/conductor/runtime-secrets
       - conductor-dbt-artifacts:/var/lib/conductor/dbt-artifacts:ro
     depends_on:
       postgres:

@@ -497,6 +497,26 @@ def test_trusted_template_has_required_normalized_compose_semantics() -> None:
     assert api_service["networks"]["ingress"]["aliases"] == [f"airflow-{PROJECT_ID}"]
     secret_mount = next(volume for volume in api_service["volumes"] if volume["target"] == "/run/secrets")
     assert secret_mount["read_only"] is True
+    api_artifact_mount = next(
+        volume for volume in api_service["volumes"] if volume["target"] == "/opt/airflow/conductor-dbt-artifacts"
+    )
+    assert api_artifact_mount["read_only"] is True
+    processor_artifact_mount = next(
+        volume
+        for volume in config["services"]["airflow-dag-processor"]["volumes"]
+        if volume["target"] == "/opt/airflow/conductor-dbt-artifacts"
+    )
+    assert processor_artifact_mount["read_only"] is True
+    worker_artifact_mount = next(
+        volume
+        for volume in config["services"]["airflow-worker"]["volumes"]
+        if volume["target"] == "/opt/airflow/conductor-dbt-artifacts"
+    )
+    assert worker_artifact_mount.get("read_only") is not True
+    assert not any(
+        volume["target"] == "/opt/airflow/conductor-dbt-artifacts"
+        for volume in config["services"]["airflow-scheduler"]["volumes"]
+    )
     assert "subpath: ${CONDUCTOR_RUNTIME_SUBPATH}" in TEMPLATE_PATH.read_text()
 
     init_service = config["services"]["airflow-init"]

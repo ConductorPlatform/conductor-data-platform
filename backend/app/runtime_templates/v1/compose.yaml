@@ -33,11 +33,6 @@ x-airflow-common: &airflow-common
       read_only: true
       volume:
         subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
-    - type: volume
-      source: conductor-dbt-artifacts
-      target: /opt/airflow/conductor-dbt-artifacts
-      volume:
-        subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
   extra_hosts:
     - host.docker.internal:host-gateway
   depends_on:
@@ -86,6 +81,21 @@ services:
   airflow-api-server:
     <<: *airflow-common
     command: airflow api-server --apps all
+    volumes:
+      - dags:/opt/airflow/dags
+      - logs:/opt/airflow/logs
+      - type: volume
+        source: conductor-runtime-secrets
+        target: /run/secrets
+        read_only: true
+        volume:
+          subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
+      - type: volume
+        source: conductor-dbt-artifacts
+        target: /opt/airflow/conductor-dbt-artifacts
+        read_only: true
+        volume:
+          subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
     networks:
       default: {}
       ingress:
@@ -104,10 +114,39 @@ services:
   airflow-dag-processor:
     <<: *airflow-common
     command: airflow dag-processor
+    volumes:
+      - dags:/opt/airflow/dags
+      - logs:/opt/airflow/logs
+      - type: volume
+        source: conductor-runtime-secrets
+        target: /run/secrets
+        read_only: true
+        volume:
+          subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
+      - type: volume
+        source: conductor-dbt-artifacts
+        target: /opt/airflow/conductor-dbt-artifacts
+        read_only: true
+        volume:
+          subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
 
   airflow-worker:
     <<: *airflow-common
     command: airflow celery worker
+    volumes:
+      - dags:/opt/airflow/dags
+      - logs:/opt/airflow/logs
+      - type: volume
+        source: conductor-runtime-secrets
+        target: /run/secrets
+        read_only: true
+        volume:
+          subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
+      - type: volume
+        source: conductor-dbt-artifacts
+        target: /opt/airflow/conductor-dbt-artifacts
+        volume:
+          subpath: ${CONDUCTOR_RUNTIME_SUBPATH}
 
 networks:
   default:

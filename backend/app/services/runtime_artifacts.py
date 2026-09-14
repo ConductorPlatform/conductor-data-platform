@@ -79,6 +79,8 @@ class RuntimeArtifactWriter:
         template_root: Path = _TEMPLATE_ROOT,
         secret_root: Path | None = None,
         artifact_root: Path | None = None,
+        runtime_uid: int = 50000,
+        runtime_gid: int = 0,
     ) -> None:
         self._runtime_root = Path(os.path.abspath(runtime_root))
         self._runtime_ingress_network = runtime_ingress_network
@@ -90,6 +92,8 @@ class RuntimeArtifactWriter:
         self._template_root = template_root.resolve()
         self._secret_root = Path(os.path.abspath(secret_root or runtime_root))
         self._artifact_root = Path(os.path.abspath(artifact_root or runtime_root))
+        self._runtime_uid = runtime_uid
+        self._runtime_gid = runtime_gid
 
     def runtime_directory(self, *, project_id: str, generation: int) -> Path:
         _validate_project_id(project_id)
@@ -114,10 +118,16 @@ class RuntimeArtifactWriter:
         return f"{project_id}/{generation}"
 
     def secret_directory(self, *, project_id: str, generation: int) -> Path:
-        return _ensure_private_generation_directory(self._secret_root, project_id, generation)
+        return _ensure_private_generation_directory(
+            self._secret_root, project_id, generation,
+            owner_uid=self._runtime_uid, owner_gid=self._runtime_gid,
+        )
 
     def artifact_directory(self, *, project_id: str, generation: int) -> Path:
-        return _ensure_private_generation_directory(self._artifact_root, project_id, generation)
+        return _ensure_private_generation_directory(
+            self._artifact_root, project_id, generation,
+            owner_uid=self._runtime_uid, owner_gid=self._runtime_gid,
+        )
 
     def write_git_token(self, *, project_id: str, generation: int, token: str) -> Path:
         """Atomically materialize the Git credential outside Compose and Airflow metadata."""
@@ -126,7 +136,9 @@ class RuntimeArtifactWriter:
             raise ValueError("Git token must be a non-empty single-line value")
         token_path = self.git_token_path(project_id=project_id, generation=generation)
         _reject_symlink(token_path, "Runtime Git token file")
-        _atomic_write(token_path, token.encode())
+        _atomic_write(
+            token_path, token.encode(), owner_uid=self._runtime_uid, owner_gid=self._runtime_gid
+        )
         return token_path
 
     def revoke_git_token(self, *, project_id: str, generation: int) -> None:
@@ -398,16 +410,27 @@ def _open_private_runtime_root(path: Path) -> int:
     return _open_private_directory(path)
 
 
-def _ensure_private_generation_directory(root: Path, project_id: str, generation: int) -> Path:
+def _ensure_private_generation_directory(
+    root: Path,
+    project_id: str,
+    generation: int,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+) -> Path:
     """Create a no-follow project/generation directory under one trusted root."""
 
     _validate_project_id(project_id)
     _validate_generation(generation)
     root_descriptor = _open_private_runtime_root(root)
     try:
-        project_descriptor = _open_private_child_directory(root_descriptor, project_id)
+        project_descriptor = _open_private_child_directory(
+            root_descriptor, project_id, owner_uid=owner_uid, owner_gid=owner_gid
+        )
         try:
-            generation_descriptor = _open_private_child_directory(project_descriptor, str(generation))
+            generation_descriptor = _open_private_child_directory(
+                project_descriptor, str(generation), owner_uid=owner_uid, owner_gid=owner_gid
+            )
         finally:
             os.close(project_descriptor)
     finally:
@@ -416,7 +439,13 @@ def _ensure_private_generation_directory(root: Path, project_id: str, generation
     return root / project_id / str(generation)
 
 
-def _open_private_child_directory(parent_descriptor: int, name: str) -> int:
+def _open_private_child_directory(
+    parent_descriptor: int,
+    name: str,
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+) -> int:
     try:
         os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
     except FileExistsError:
@@ -429,7 +458,10 @@ def _open_private_child_directory(parent_descriptor: int, name: str) -> int:
         raise ValueError("Runtime artifact path component must not be a symlink")
     if not stat.S_ISDIR(child_stat.st_mode):
         raise ValueError("Runtime artifact path component must be a directory")
-    return _open_private_directory(name, dir_fd=parent_descriptor)
+    descriptor = _open_private_directory(name, dir_fd=parent_descriptor)
+    if owner_uid is not None and owner_gid is not None:
+        _set_runtime_owner(descriptor, owner_uid, owner_gid)
+    return descriptor
 
 
 def _open_private_directory(path: str | Path, *, dir_fd: int | None = None) -> int:
@@ -448,7 +480,13 @@ def _open_private_directory(path: str | Path, *, dir_fd: int | None = None) -> i
     return descriptor
 
 
-def _atomic_write(destination: Path, content: bytes) -> None:
+def _atomic_write(
+    destination: Path,
+    content: bytes,
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+) -> None:
     temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
     try:
         with temporary.open("xb", buffering=0) as file_handle:
@@ -458,6 +496,8 @@ def _atomic_write(destination: Path, content: bytes) -> None:
             os.fsync(file_handle.fileno())
         os.replace(temporary, destination)
         os.chmod(destination, 0o600)
+        if owner_uid is not None and owner_gid is not None:
+            _set_runtime_owner_path(destination, owner_uid, owner_gid)
         _fsync_directory(destination.parent)
     finally:
         if temporary.exists():
@@ -470,6 +510,25 @@ def _fsync_directory(directory: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _set_runtime_owner(descriptor: int, uid: int, gid: int) -> None:
+    """Make project volume subpaths readable by the fixed Airflow identity.
+
+    The lifecycle worker runs as root. Unit tests run as an unprivileged user,
+    so they preserve their temporary-file ownership while exercising the same
+    no-follow and mode semantics.
+    """
+
+    if os.geteuid() == 0:
+        os.fchown(descriptor, uid, gid)
+    os.fchmod(descriptor, 0o700)
+
+
+def _set_runtime_owner_path(path: Path, uid: int, gid: int) -> None:
+    if os.geteuid() == 0:
+        os.chown(path, uid, gid, follow_symlinks=False)
+    os.chmod(path, 0o600)
 
 
 def _publish_generation_atomically(

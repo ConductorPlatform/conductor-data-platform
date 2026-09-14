@@ -22,7 +22,7 @@ from airflow.providers.git.hooks.git import GitHook
 
 _CONNECTION_ID = "conductor_git"
 _REQUIRED_EXTRA_KEYS = frozenset({"conductor_tracking_ref", "conductor_dags_path", "conductor_dbt_path"})
-_TOKEN_FILE = Path("/run/secrets/conductor-git-token")
+_TOKEN_FILE = Path("/run/secrets/git-token")
 
 
 def _connection_metadata(connection_id: str) -> tuple[str, str, str]:
