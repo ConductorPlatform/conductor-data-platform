@@ -1,5 +1,15 @@
 const API = '/api/v1';
 
+export class ApiError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 export async function apiFetch(path: string, options: RequestInit = {}) {
   const token = localStorage.getItem('conductor_token');
   const headers: Record<string, string> = {
@@ -17,7 +27,7 @@ export async function apiFetch(path: string, options: RequestInit = {}) {
   }
   if (!r.ok) {
     const err = await r.json().catch(() => ({ detail: r.statusText }));
-    throw new Error(err.detail || 'Request failed');
+    throw new ApiError(r.status, err.detail || 'Request failed');
   }
   if (r.status === 204) return null;
   return r.json();

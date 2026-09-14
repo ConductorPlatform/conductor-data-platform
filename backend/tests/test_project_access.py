@@ -91,6 +91,11 @@ NON_READY_ROUTE_CASES = (
     RouteCase("GET", "/api/v1/projects/gated-project/airflow-iframe/home"),
     RouteCase("GET", "/api/v1/projects/gated-project/airflow/dags"),
     RouteCase("GET", "/api/v1/projects/gated-project/airflow/dags/example/runs"),
+    RouteCase("POST", "/api/v1/projects/gated-project/airflow/dags/example/runs"),
+    RouteCase(
+        "GET",
+        "/api/v1/projects/gated-project/airflow/dags/example/runs/run-a/artifacts/manifest.json",
+    ),
     RouteCase("GET", "/api/v1/projects/gated-project/airflow/stats"),
     RouteCase("POST", "/api/v1/projects/gated-project/codeserver/token"),
     RouteCase("GET", "/api/v1/projects/gated-project/codeserver/iframe"),

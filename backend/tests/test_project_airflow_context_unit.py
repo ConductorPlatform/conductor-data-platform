@@ -33,6 +33,7 @@ class _ScalarResult:
     [
         "/api/v1/projects/project-a/airflow/dags",
         "/api/v1/projects/project-a/airflow/dags/example/runs",
+        "/api/v1/projects/project-a/airflow/dags/example/runs/run-a/artifacts/manifest.json",
         "/api/v1/projects/project-a/airflow/stats",
     ],
 )
@@ -580,3 +581,131 @@ async def test_airflow_stats_surfaces_each_upstream_error(monkeypatch, failing_r
     assert error.value.status_code == 502
     assert error.value.detail == "Airflow API error"
     assert len(calls) == failing_response_index + 1
+
+
+@pytest.mark.asyncio
+async def test_trigger_dag_run_uses_run_permission_and_returns_provenance(monkeypatch):
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project-a:8080",
+        account_key="dev",
+    )
+    calls = []
+
+    async def resolve(*args):
+        calls.append(("resolve", args[3:]))
+        return context
+
+    async def get_access_token(*_args):
+        return "airflow-access-token"
+
+    class Response:
+        status_code = 201
+
+        @staticmethod
+        def json():
+            return {
+                "dag_run_id": "manual__2026-02-03T04:05:06+00:00",
+                "state": "queued",
+                "logical_date": "2026-02-03T04:05:06+00:00",
+                "commit_sha": "0123456789abcdef",
+                "logs_url": "dags/example/runs/manual/logs",
+                "artifacts": ["manifest.json", {"name": "run_results.json"}],
+            }
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, **kwargs):
+            calls.append(("post", url, kwargs))
+            return Response()
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", get_access_token)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+
+    run = await widgets.trigger_dag_run(
+        "project-a", "example", cast(User, SimpleNamespace(id="user-a")), object()
+    )
+
+    assert calls == [
+        ("resolve", ("project.dag.run", "write")),
+        (
+            "post",
+            "http://airflow-project-a:8080/api/v2/dags/example/dagRuns",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}, "json": {}},
+        ),
+    ]
+    assert run.commit_sha == "0123456789abcdef"
+    assert run.logs_url == "/api/v1/projects/project-a/airflow-proxy/dags/example/runs/manual/logs"
+    assert [artifact.name for artifact in run.artifacts] == ["manifest.json", "run_results.json"]
+
+
+@pytest.mark.asyncio
+async def test_trigger_denial_happens_before_airflow_session_or_upstream(monkeypatch):
+    async def denied(*_args):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    async def forbidden_session(*_args):
+        raise AssertionError("authorization must happen before session access")
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", denied)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", forbidden_session)
+
+    with pytest.raises(HTTPException) as error:
+        await widgets.trigger_dag_run(
+            "project-b", "example", cast(User, SimpleNamespace(id="outsider")), object()
+        )
+
+    assert error.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_artifact_route_authorizes_allowed_name_before_reporting_unavailable(monkeypatch):
+    calls = []
+
+    async def resolve(*args):
+        calls.append(args[3:])
+        return SimpleNamespace()
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+
+    with pytest.raises(HTTPException) as error:
+        await widgets.download_dag_run_artifact(
+            "project-a", "example", "run-a", "manifest.json", cast(User, SimpleNamespace(id="viewer")), object()
+        )
+
+    assert error.value.status_code == 404
+    assert error.value.detail == "Artifact not available"
+    assert calls == [("project.dag.view", "read")]
+
+
+def test_dag_run_info_rejects_malformed_artifact_and_does_not_expose_external_log_url():
+    with pytest.raises(HTTPException) as error:
+        widgets._dag_run_info(
+            "project-a",
+            "example",
+            {
+                "dag_run_id": "run-a",
+                "logical_date": "2026-02-03T04:05:06+00:00",
+                "artifacts": ["not-allowed.json"],
+            },
+        )
+
+    assert error.value.status_code == 502
+    safe_run = widgets._dag_run_info(
+        "project-a",
+        "example",
+        {
+            "dag_run_id": "run-a",
+            "logical_date": "2026-02-03T04:05:06+00:00",
+            "logs_url": "https://attacker.test/logs",
+        },
+    )
+    assert safe_run.logs_url is None
