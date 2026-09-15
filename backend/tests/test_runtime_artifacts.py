@@ -40,6 +40,17 @@ def test_runtime_bundle_configuration_retains_git_metadata_for_versioned_checkou
     assert '"prune_dotgit_folder":false' in template
 
 
+def test_runtime_template_configures_airflow_execution_api_under_core() -> None:
+    template = TEMPLATE_PATH.read_text()
+
+    # Airflow 3.3 reads the execution API endpoint from ``[core]``. The
+    # similarly named ``[api]`` environment key is ignored, leaving DAG
+    # processors unable to resolve the GitDagBundle connection created through
+    # the Airflow API server.
+    assert "AIRFLOW__CORE__EXECUTION_API_SERVER_URL" in template
+    assert "AIRFLOW__API__EXECUTION_API_SERVER_URL" not in template
+
+
 @pytest.fixture
 def runtime_spec() -> RuntimeArtifactSpec:
     return RuntimeArtifactSpec(
