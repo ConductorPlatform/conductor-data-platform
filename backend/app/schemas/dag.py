@@ -18,17 +18,25 @@ class DAGSummary(BaseModel):
 
 class DAGRunInfo(BaseModel):
     run_id: str
+    run_type: str
     state: str
     execution_date: datetime
     start_date: datetime | None
     end_date: datetime | None
     duration: float | None
     commit_sha: str | None = None
-    error_summary: str | None = None
-    logs_url: str | None = None
     artifacts: list["DAGRunArtifact"] = Field(default_factory=list)
 
 
 class DAGRunArtifact(BaseModel):
     name: Literal["manifest.json", "run_results.json"]
     download_url: str
+
+
+class DAGRunDiagnostics(BaseModel):
+    task_id: str
+    state: Literal["failed", "upstream_failed"]
+    try_number: int
+    map_index: int
+    summary: str
+    logs_url: str | None = None

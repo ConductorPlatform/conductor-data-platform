@@ -47,6 +47,11 @@ def _request(
     ("method", "path", "expected"),
     [
         ("GET", "api/v2/dags", ("project.dag.view", "read")),
+        (
+            "GET",
+            "api/v2/dags/example/dagRuns/run/taskInstances/dbt/logs/2",
+            ("project.dag.view", "read"),
+        ),
         ("HEAD", "dags/example", ("project.dag.view", "read")),
         ("POST", "api/v2/dags/example/dagRuns", ("project.dag.run", "write")),
     ],

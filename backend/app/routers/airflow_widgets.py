@@ -14,7 +14,7 @@ from app.config import settings
 from app.database import get_db_session
 from app.models.user import User
 from app.schemas.airflow import AirflowStatsResponse
-from app.schemas.dag import DAGRunArtifact, DAGRunInfo, DAGSummary
+from app.schemas.dag import DAGRunArtifact, DAGRunDiagnostics, DAGRunInfo, DAGSummary
 from app.services.airflow_session import AirflowSessionManager
 from app.services.dbt_artifact_reader import (
     ArtifactIntegrityError,
@@ -119,13 +119,6 @@ def _is_immutable_commit(value: str | None) -> bool:
     )
 
 
-def _project_proxy_url(slug: str, path: object) -> str | None:
-    """Expose only a local, project-scoped proxy path for an upstream log link."""
-    if not isinstance(path, str) or not path or path.startswith(("/", "\\")) or "://" in path:
-        return None
-    return f"/api/v1/projects/{slug}/airflow-proxy/{path}"
-
-
 def _dag_run_artifacts(slug: str, dag_id: str, run_id: str, value: object) -> list[DAGRunArtifact]:
     if value is None:
         return []
@@ -152,9 +145,10 @@ def _dag_run_info(slug: str, dag_id: str, run: object) -> DAGRunInfo:
     if not isinstance(run, dict):
         raise _airflow_error()
     run_id = _optional_string(run.get("dag_run_id"))
+    run_type = _optional_string(run.get("run_type"))
     state = _optional_string(run.get("state"))
     execution_date = run.get("logical_date", run.get("execution_date"))
-    if run_id is None or state is None or not isinstance(execution_date, str) or not execution_date:
+    if run_id is None or run_type is None or state is None or not isinstance(execution_date, str) or not execution_date:
         raise _airflow_error()
     commit_sha = _nullable_string(run, "commit_sha") or _nullable_string(run, "bundle_version")
     artifacts = _dag_run_artifacts(slug, dag_id, run_id, run.get("artifacts"))
@@ -164,6 +158,7 @@ def _dag_run_info(slug: str, dag_id: str, run: object) -> DAGRunInfo:
         return DAGRunInfo.model_validate(
             {
                 "run_id": run_id,
+                "run_type": run_type,
                 "state": state,
                 "execution_date": execution_date,
                 "start_date": _nullable_string(run, "start_date"),
@@ -173,8 +168,6 @@ def _dag_run_info(slug: str, dag_id: str, run: object) -> DAGRunInfo:
                 # ``bundle_version``. Keep accepting the legacy normalized
                 # field so an already-adapted upstream remains compatible.
                 "commit_sha": commit_sha,
-                "error_summary": _nullable_string(run, "error_summary"),
-                "logs_url": _project_proxy_url(slug, _nullable_string(run, "logs_url")),
                 "artifacts": artifacts,
             }
         )
@@ -227,7 +220,7 @@ async def list_dag_runs(
     async with httpx.AsyncClient() as client:
         resp = await _airflow_get(
             client,
-            f"{context.airflow_base_url}/api/v2/dags/{dag_id}/dagRuns",
+            f"{context.airflow_base_url}/api/v2/dags/{quote(dag_id, safe='')}/dagRuns",
             headers={"Authorization": f"Bearer {access_token}"},
         )
     data = _airflow_response_data(resp)
@@ -235,6 +228,121 @@ async def list_dag_runs(
     if not isinstance(runs, list):
         raise _airflow_error()
     return [_dag_run_info(slug, dag_id, run) for run in runs]
+
+
+def _task_instance_diagnostics(
+    task_instances: object,
+) -> tuple[str, Literal["failed", "upstream_failed"], int, int]:
+    """Select one validated terminal failure without accepting arbitrary log URLs."""
+    if not isinstance(task_instances, list):
+        raise _airflow_error()
+
+    candidates: list[tuple[int, str, int, int, Literal["failed", "upstream_failed"]]] = []
+    for task_instance in task_instances:
+        if not isinstance(task_instance, dict):
+            raise _airflow_error()
+        state = task_instance.get("state")
+        if state not in {"failed", "upstream_failed"}:
+            continue
+        task_id = _optional_string(task_instance.get("task_id"))
+        try_number = task_instance.get("try_number")
+        map_index = task_instance.get("map_index")
+        if (
+            task_id is None
+            or isinstance(try_number, bool)
+            or not isinstance(try_number, int)
+            or try_number < 0
+            or isinstance(map_index, bool)
+            or not isinstance(map_index, int)
+        ):
+            raise _airflow_error()
+        candidates.append((0 if state == "failed" else 1, task_id, map_index, try_number, state))
+
+    if not candidates:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Failed task instance not found")
+    _, task_id, map_index, try_number, state = min(candidates)
+    return task_id, state, try_number, map_index
+
+
+def _task_log_data(data: dict) -> None:
+    """Validate the native log response without placing log contents in our API."""
+    content = data.get("content")
+    continuation_token = data.get("continuation_token")
+    if (
+        not isinstance(content, list)
+        or any(not isinstance(item, (str, dict)) for item in content)
+        or (continuation_token is not None and not isinstance(continuation_token, str))
+    ):
+        raise _airflow_error()
+
+
+def _diagnostic_logs_proxy_url(
+    slug: str, dag_id: str, run_id: str, task_id: str, try_number: int, map_index: int
+) -> str:
+    path = "/".join(
+        (
+            "api/v2/dags",
+            quote(dag_id, safe=""),
+            "dagRuns",
+            quote(run_id, safe=""),
+            "taskInstances",
+            quote(task_id, safe=""),
+            "logs",
+            str(try_number),
+        )
+    )
+    return (
+        f"/api/v1/projects/{quote(slug, safe='')}/airflow-proxy/{path}"
+        f"?full_content=true&map_index={map_index}"
+    )
+
+
+@router.get(
+    "/projects/{slug}/airflow/dags/{dag_id}/runs/{run_id}/diagnostics",
+    response_model=DAGRunDiagnostics,
+)
+async def get_dag_run_diagnostics(
+    slug: str,
+    dag_id: str,
+    run_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Retrieve one failed task's native diagnostics only when a user requests it."""
+    context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
+    access_token = await AirflowSessionManager().get_access_token(context, db)
+    headers = {"Authorization": f"Bearer {access_token}"}
+    base_url = (
+        f"{context.airflow_base_url}/api/v2/dags/{quote(dag_id, safe='')}"
+        f"/dagRuns/{quote(run_id, safe='')}"
+    )
+    async with httpx.AsyncClient() as client:
+        instances_response = await _airflow_get(client, f"{base_url}/taskInstances", headers=headers)
+        instances_data = _airflow_response_data(instances_response)
+        task_id, state, try_number, map_index = _task_instance_diagnostics(
+            instances_data.get("task_instances")
+        )
+        logs_url = None
+        if state == "failed":
+            if try_number < 1:
+                raise _airflow_error()
+            logs_response = await _airflow_get(
+                client,
+                f"{base_url}/taskInstances/{quote(task_id, safe='')}/logs/{try_number}",
+                headers=headers,
+                params={"full_content": "true", "map_index": map_index},
+            )
+            _task_log_data(_airflow_response_data(logs_response))
+            logs_url = _diagnostic_logs_proxy_url(slug, dag_id, run_id, task_id, try_number, map_index)
+
+    return DAGRunDiagnostics(
+        task_id=task_id,
+        state=state,
+        try_number=try_number,
+        map_index=map_index,
+        summary=f"Task {task_id} {state.replace('_', ' ')} on try {try_number}",
+        logs_url=logs_url,
+    )
 
 
 @router.post(
@@ -254,7 +362,7 @@ async def trigger_dag_run(
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                f"{context.airflow_base_url}/api/v2/dags/{dag_id}/dagRuns",
+                f"{context.airflow_base_url}/api/v2/dags/{quote(dag_id, safe='')}/dagRuns",
                 headers={"Authorization": f"Bearer {access_token}"},
                 json={},
             )
@@ -279,7 +387,8 @@ async def download_dag_run_artifact(
     context = await resolve_project_airflow_context(slug, user, db, "project.dag.view", "read")
     access_token = await AirflowSessionManager().get_access_token(context, db)
     async with httpx.AsyncClient() as client:
-        upstream = await client.get(
+        upstream = await _airflow_get(
+            client,
             f"{context.airflow_base_url}/api/v2/dags/{quote(dag_id, safe='')}/dagRuns/{quote(run_id, safe='')}",
             headers={"Authorization": f"Bearer {access_token}"},
         )

@@ -28,6 +28,7 @@ const mockDags = [
 const mockRuns = [
   {
     run_id: 'run_1',
+    run_type: 'scheduled',
     state: 'success',
     execution_date: '2026-07-15T00:00:00Z',
     start_date: null,
@@ -35,6 +36,7 @@ const mockRuns = [
   },
   {
     run_id: 'run_2',
+    run_type: 'manual',
     state: 'failed',
     execution_date: '2026-07-14T00:00:00Z',
     start_date: null,
@@ -212,14 +214,13 @@ describe('PipelinePage', () => {
   it('shows run provenance, diagnostics, links, and triggers the selected DAG', async () => {
     const detailedRun = {
       run_id: 'run_with_provenance',
+      run_type: 'scheduled',
       state: 'failed',
       execution_date: '2026-07-15T00:00:00Z',
       start_date: null,
       end_date: null,
       duration: null,
       commit_sha: '0123456789abcdef0123456789abcdef',
-      error_summary: 'dbt test failed',
-      logs_url: '/api/v1/projects/test/airflow-proxy/dags/etl_main/logs',
       artifacts: [{
         name: 'manifest.json',
         download_url: '/api/v1/projects/test/airflow/dags/etl_main/runs/run_with_provenance/artifacts/manifest.json',
@@ -228,6 +229,14 @@ describe('PipelinePage', () => {
     window.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('/stats')) return Promise.resolve(Response.json(mockStats));
+      if (url.includes('/diagnostics')) return Promise.resolve(Response.json({
+        task_id: 'dbt_run',
+        state: 'failed',
+        try_number: 1,
+        map_index: -1,
+        summary: 'Task dbt_run failed on try 1',
+        logs_url: '/api/v1/projects/test/airflow-proxy/api/v2/dags/etl_main/dagRuns/run_with_provenance/taskInstances/dbt_run/logs/1?full_content=true&map_index=-1',
+      }));
       if (init?.method === 'POST' && url.endsWith('/runs')) return Promise.resolve(Response.json(detailedRun, { status: 201 }));
       if (url.includes('/runs')) return Promise.resolve(Response.json([detailedRun]));
       return Promise.resolve(Response.json(mockDags));
@@ -240,9 +249,14 @@ describe('PipelinePage', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: /etl_main/ }));
     fireEvent.click(screen.getByText('Recent Runs'));
-    expect(await screen.findByText('dbt test failed')).toBeInTheDocument();
-    expect(screen.getByTitle('0123456789abcdef0123456789abcdef')).toHaveTextContent('0123456789ab');
-    expect(screen.getByRole('link', { name: 'Logs' })).toHaveAttribute('href', detailedRun.logs_url);
+    expect(await screen.findByTitle('0123456789abcdef0123456789abcdef')).toHaveTextContent('0123456789ab');
+    expect(screen.getByText('SCHEDULED')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show failure details' }));
+    expect(await screen.findByText('Task dbt_run failed on try 1')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Logs' })).toHaveAttribute(
+      'href',
+      '/api/v1/projects/test/airflow-proxy/api/v2/dags/etl_main/dagRuns/run_with_provenance/taskInstances/dbt_run/logs/1?full_content=true&map_index=-1',
+    );
 
     const createObjectURL = vi.fn(() => 'blob:manifest');
     const revokeObjectURL = vi.fn();

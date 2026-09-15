@@ -98,6 +98,7 @@ def test_dag_run_info_exposes_native_bundle_provenance_and_artifact_links():
         "example",
         {
             "dag_run_id": "run-a",
+            "run_type": "scheduled",
             "state": "success",
             "logical_date": "2026-02-03T04:05:06+00:00",
             "bundle_version": commit,
@@ -105,10 +106,115 @@ def test_dag_run_info_exposes_native_bundle_provenance_and_artifact_links():
     )
 
     assert run.commit_sha == commit
+    assert run.run_type == "scheduled"
     assert [(artifact.name, artifact.download_url) for artifact in run.artifacts] == [
         ("manifest.json", "/api/v1/projects/project-a/airflow/dags/example/runs/run-a/artifacts/manifest.json"),
         ("run_results.json", "/api/v1/projects/project-a/airflow/dags/example/runs/run-a/artifacts/run_results.json"),
     ]
+
+
+@pytest.mark.parametrize(
+    "task_instances",
+    [
+        [],
+        [{"task_id": "dbt", "state": "failed", "try_number": True, "map_index": -1}],
+        [{"task_id": "dbt", "state": "failed", "try_number": 1, "map_index": True}],
+        [{"task_id": "", "state": "upstream_failed", "try_number": 0, "map_index": -1}],
+    ],
+)
+def test_task_instance_diagnostics_rejects_missing_or_malformed_failure_data(task_instances):
+    with pytest.raises(HTTPException) as error:
+        widgets._task_instance_diagnostics(task_instances)
+
+    assert error.value.status_code in {404, 502}
+
+
+def test_task_instance_diagnostics_prefers_real_failed_task_and_encodes_local_log_url():
+    assert widgets._task_instance_diagnostics([
+        {"task_id": "downstream", "state": "upstream_failed", "try_number": 0, "map_index": -1},
+        {"task_id": "dbt / run", "state": "failed", "try_number": 2, "map_index": 3},
+        {"task_id": "success", "state": "success"},
+    ]) == ("dbt / run", "failed", 2, 3)
+    assert widgets._diagnostic_logs_proxy_url(
+        "project a", "dag / id", "run / id", "dbt / run", 2, 3
+    ) == (
+        "/api/v1/projects/project%20a/airflow-proxy/api/v2/dags/dag%20%2F%20id/"
+        "dagRuns/run%20%2F%20id/taskInstances/dbt%20%2F%20run/logs/2?full_content=true&map_index=3"
+    )
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_uses_native_task_instances_then_logs_with_project_view_permission(monkeypatch):
+    context = ProjectAirflowContext(
+        project_id="project-a",
+        deployment_id="deployment-a",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project-a:8080",
+        account_key="viewer",
+    )
+    calls = []
+
+    async def resolve(*args):
+        calls.append(("resolve", args[3:]))
+        return context
+
+    async def token(*_args):
+        return "airflow-access-token"
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, url, **kwargs):
+            calls.append(("get", url, kwargs))
+            if url.endswith("/taskInstances"):
+                return Response({"task_instances": [
+                    {"task_id": "succeeded", "state": "success"},
+                    {"task_id": "dbt / run", "state": "failed", "try_number": 2, "map_index": -1},
+                ]})
+            return Response({"content": ["dbt test failure marker"], "continuation_token": None})
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", token)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+
+    diagnostics = await widgets.get_dag_run_diagnostics(
+        "project-a", "dag / id", "run / id", cast(User, SimpleNamespace(id="viewer")), object()
+    )
+
+    assert calls[0] == ("resolve", ("project.dag.view", "read"))
+    assert calls[1:] == [
+        (
+            "get",
+            "http://airflow-project-a:8080/api/v2/dags/dag%20%2F%20id/dagRuns/run%20%2F%20id/taskInstances",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}},
+        ),
+        (
+            "get",
+            "http://airflow-project-a:8080/api/v2/dags/dag%20%2F%20id/dagRuns/run%20%2F%20id/taskInstances/dbt%20%2F%20run/logs/2",
+            {"headers": {"Authorization": "Bearer airflow-access-token"}, "params": {"full_content": "true", "map_index": -1}},
+        ),
+    ]
+    assert diagnostics.model_dump() == {
+        "task_id": "dbt / run",
+        "state": "failed",
+        "try_number": 2,
+        "map_index": -1,
+        "summary": "Task dbt / run failed on try 2",
+        "logs_url": "/api/v1/projects/project-a/airflow-proxy/api/v2/dags/dag%20%2F%20id/dagRuns/run%20%2F%20id/taskInstances/dbt%20%2F%20run/logs/2?full_content=true&map_index=-1",
+    }
 
 
 @pytest.mark.asyncio

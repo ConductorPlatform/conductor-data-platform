@@ -6,7 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import httpx
 import pytest
+from fastapi import HTTPException
 
 from app.config import settings
 from app.models.user import User
@@ -92,3 +94,45 @@ async def test_artifact_endpoint_authorizes_run_provenance_and_streams_indexed_b
     assert response.status_code == 200
     assert response.body == b'{"artifact": true}\n'
     assert response.headers["content-disposition"] == 'attachment; filename="manifest.json"'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [httpx.ConnectError("offline"), httpx.ReadTimeout("timed out")])
+async def test_artifact_provenance_transport_errors_are_sanitized(monkeypatch, error) -> None:
+    import app.routers.airflow_widgets as widgets
+
+    context = ProjectAirflowContext(
+        project_id=PROJECT_ID,
+        deployment_id="deployment",
+        deployment_generation=7,
+        airflow_base_url="http://airflow-project:8080",
+        account_key="viewer",
+    )
+
+    async def resolve(*_args):
+        return context
+
+    async def token(*_args):
+        return "airflow-token"
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, *_args, **_kwargs):
+            raise error
+
+    monkeypatch.setattr(widgets, "resolve_project_airflow_context", resolve)
+    monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", token)
+    monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
+
+    with pytest.raises(HTTPException) as raised:
+        await widgets.download_dag_run_artifact(
+            "project", "dag", "run", "manifest.json", cast(User, SimpleNamespace(id="user")), object()
+        )
+
+    assert raised.value.status_code == 502
+    assert raised.value.detail == "Airflow API error"

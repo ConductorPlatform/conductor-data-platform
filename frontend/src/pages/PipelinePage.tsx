@@ -14,18 +14,26 @@ interface DAG {
 
 interface DAGRun {
   run_id: string;
+  run_type: string;
   state: string;
   execution_date: string;
   start_date: string | null;
   end_date: string | null;
   duration: number | null;
   commit_sha: string | null;
-  error_summary: string | null;
-  logs_url: string | null;
   artifacts: Array<{
     name: 'manifest.json' | 'run_results.json';
     download_url: string;
   }>;
+}
+
+interface DAGRunDiagnostics {
+  task_id: string;
+  state: 'failed' | 'upstream_failed';
+  try_number: number;
+  map_index: number;
+  summary: string;
+  logs_url: string | null;
 }
 
 interface AirflowStats {
@@ -70,6 +78,9 @@ export default function PipelinePage() {
   const [runsError, setRunsError] = useState<string | null>(null);
   const [triggerLoading, setTriggerLoading] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [diagnostics, setDiagnostics] = useState<Record<string, DAGRunDiagnostics | undefined>>({});
+  const [diagnosticsLoading, setDiagnosticsLoading] = useState<string | null>(null);
+  const [diagnosticsError, setDiagnosticsError] = useState<Record<string, string | undefined>>({});
   const [iframePath, setIframePath] = useState<string | null>(null);
   const projectRole = user?.projects.find((project) => project.slug === slug)?.role;
   const canTrigger = Boolean(user?.is_admin || (projectRole && triggerRoles.has(projectRole)));
@@ -104,6 +115,8 @@ export default function PipelinePage() {
     try {
       const data = await apiFetch(`/projects/${slug}/airflow/dags/${dagId}/runs`) as DAGRun[];
       setRuns(data);
+      setDiagnostics({});
+      setDiagnosticsError({});
     } catch (error) {
       setRunsError(errorMessage(error));
     } finally {
@@ -168,6 +181,22 @@ export default function PipelinePage() {
       URL.revokeObjectURL(objectUrl);
     } catch (error) {
       setActionError(errorMessage(error));
+    }
+  };
+
+  const handleShowFailureDetails = async (run: DAGRun) => {
+    if (!selectedDag) return;
+    setDiagnosticsLoading(run.run_id);
+    setDiagnosticsError((current) => ({ ...current, [run.run_id]: undefined }));
+    try {
+      const result = await apiFetch(
+        `/projects/${slug}/airflow/dags/${selectedDag}/runs/${run.run_id}/diagnostics`,
+      ) as DAGRunDiagnostics;
+      setDiagnostics((current) => ({ ...current, [run.run_id]: result }));
+    } catch (error) {
+      setDiagnosticsError((current) => ({ ...current, [run.run_id]: errorMessage(error) }));
+    } finally {
+      setDiagnosticsLoading(null);
     }
   };
 
@@ -277,14 +306,37 @@ export default function PipelinePage() {
             <div key={run.run_id} className="flex flex-wrap items-center gap-y-1 px-4 py-2.5 border-b border-[#2a2b36]">
               <span className="flex-1 text-sm text-gray-300 font-mono text-xs">{run.run_id}</span>
               <span className={`text-xs font-medium ${runStateColor(run.state)}`}>{run.state.toUpperCase()}</span>
+              <span className="ml-2 text-xs text-gray-500">{run.run_type.toUpperCase()}</span>
               <span className="text-xs text-gray-500 ml-4 w-36 text-right">
                 {run.execution_date ? new Date(run.execution_date).toLocaleString() : '—'}
               </span>
               {run.commit_sha && (
                 <span title={run.commit_sha} className="ml-4 text-xs font-mono text-[#a5b4fc]">{run.commit_sha.slice(0, 12)}</span>
               )}
-              {run.error_summary && <p className="ml-4 text-xs text-red-300">{run.error_summary}</p>}
-              {run.logs_url && <a className="ml-4 text-xs text-[#818cf8] hover:underline" href={run.logs_url}>Logs</a>}
+              {run.state === 'failed' && (
+                <button
+                  type="button"
+                  onClick={() => void handleShowFailureDetails(run)}
+                  disabled={diagnosticsLoading === run.run_id}
+                  className="ml-4 text-xs text-[#818cf8] hover:underline disabled:opacity-60"
+                >
+                  {diagnosticsLoading === run.run_id ? 'Loading failure details…' : 'Show failure details'}
+                </button>
+              )}
+              {diagnosticsError[run.run_id] && (
+                <span role="alert" className="ml-4 text-xs text-red-300">
+                  Unable to load failure details: {diagnosticsError[run.run_id]}
+                  <button type="button" onClick={() => void handleShowFailureDetails(run)} className="ml-2 underline">Retry</button>
+                </span>
+              )}
+              {diagnostics[run.run_id] && (
+                <span className="ml-4 text-xs text-red-300">
+                  {diagnostics[run.run_id]?.summary}
+                  {diagnostics[run.run_id]?.logs_url && (
+                    <a className="ml-2 text-[#818cf8] hover:underline" href={diagnostics[run.run_id]?.logs_url ?? undefined}>Logs</a>
+                  )}
+                </span>
+              )}
               {run.artifacts?.map((artifact) => (
                 <button
                   key={artifact.name}

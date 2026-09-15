@@ -403,6 +403,7 @@ async def test_list_dag_runs_maps_airflow_logical_date_to_execution_date(monkeyp
                 "dag_runs": [
                     {
                         "dag_run_id": "scheduled__2026-02-03T04:05:06+00:00",
+                        "run_type": "scheduled",
                         "state": "success",
                         "logical_date": "2026-02-03T04:05:06+00:00",
                         "start_date": "2026-02-03T04:05:10+00:00",
@@ -612,10 +613,10 @@ async def test_trigger_dag_run_uses_run_permission_and_returns_provenance(monkey
         def json():
             return {
                 "dag_run_id": "manual__2026-02-03T04:05:06+00:00",
+                "run_type": "manual",
                 "state": "queued",
                 "logical_date": "2026-02-03T04:05:06+00:00",
                 "commit_sha": "0123456789abcdef",
-                "logs_url": "dags/example/runs/manual/logs",
                 "artifacts": ["manifest.json", {"name": "run_results.json"}],
             }
 
@@ -647,7 +648,7 @@ async def test_trigger_dag_run_uses_run_permission_and_returns_provenance(monkey
         ),
     ]
     assert run.commit_sha == "0123456789abcdef"
-    assert run.logs_url == "/api/v1/projects/project-a/airflow-proxy/dags/example/runs/manual/logs"
+    assert run.run_type == "manual"
     assert [artifact.name for artifact in run.artifacts] == ["manifest.json", "run_results.json"]
 
 
@@ -685,13 +686,14 @@ async def test_artifact_route_rejects_unknown_name_before_authorization_or_upstr
     assert error.value.detail == "Artifact not found"
 
 
-def test_dag_run_info_rejects_malformed_artifact_and_does_not_expose_external_log_url():
+def test_dag_run_info_rejects_malformed_artifact_and_ignores_non_native_log_fields():
     with pytest.raises(HTTPException) as error:
         widgets._dag_run_info(
             "project-a",
             "example",
             {
                 "dag_run_id": "run-a",
+                "run_type": "manual",
                 "state": "failed",
                 "logical_date": "2026-02-03T04:05:06+00:00",
                 "artifacts": ["not-allowed.json"],
@@ -704,12 +706,13 @@ def test_dag_run_info_rejects_malformed_artifact_and_does_not_expose_external_lo
         "example",
         {
             "dag_run_id": "run-a",
+            "run_type": "scheduled",
             "state": "success",
             "logical_date": "2026-02-03T04:05:06+00:00",
             "logs_url": "https://attacker.test/logs",
         },
     )
-    assert safe_run.logs_url is None
+    assert "logs_url" not in safe_run.model_fields_set
 
 
 @pytest.mark.asyncio
