@@ -1,7 +1,15 @@
-import { describe, it, expect, vi, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterAll } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import PipelinePage from '../../pages/PipelinePage';
+
+const auth = vi.hoisted(() => ({
+  user: null as { is_admin: boolean; projects: Array<{ slug: string; role: string }> } | null,
+}));
+
+vi.mock('../../lib/auth', () => ({
+  useAuth: () => ({ user: auth.user }),
+}));
 
 const mockStats = {
   active_dags: 5,
@@ -46,6 +54,14 @@ describe('PipelinePage', () => {
       }
       return Promise.resolve(Response.json(mockDags));
     }) as typeof fetch;
+  });
+
+  beforeEach(() => {
+    auth.user = {
+      is_admin: false,
+      projects: [{ slug: 'test', role: 'developer' }],
+    };
+    localStorage.setItem('conductor_token', 'test-token');
   });
 
   afterAll(() => {
@@ -161,5 +177,109 @@ describe('PipelinePage', () => {
         '/api/v1/projects/test/airflow-proxy/dags/etl_main',
       );
     });
+  });
+
+  it('shows a forbidden state instead of an empty pipeline', async () => {
+    window.fetch = vi.fn(() => Promise.resolve(Response.json(
+      { detail: 'Access denied' },
+      { status: 403 },
+    ))) as typeof fetch;
+    render(
+      <MemoryRouter initialEntries={['/projects/test/pipeline']}>
+        <Routes><Route path="/projects/:slug/pipeline" element={<PipelinePage />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Access to this pipeline is forbidden.');
+    expect(screen.queryByText('No DAGs found')).not.toBeInTheDocument();
+  });
+
+  it('shows an upstream API failure instead of an empty pipeline', async () => {
+    window.fetch = vi.fn(() => Promise.resolve(Response.json(
+      { detail: 'Airflow API error' },
+      { status: 502 },
+    ))) as typeof fetch;
+    render(
+      <MemoryRouter initialEntries={['/projects/test/pipeline']}>
+        <Routes><Route path="/projects/:slug/pipeline" element={<PipelinePage />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Pipeline data is unavailable.');
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+  });
+
+  it('shows run provenance, diagnostics, links, and triggers the selected DAG', async () => {
+    const detailedRun = {
+      run_id: 'run_with_provenance',
+      state: 'failed',
+      execution_date: '2026-07-15T00:00:00Z',
+      start_date: null,
+      end_date: null,
+      duration: null,
+      commit_sha: '0123456789abcdef0123456789abcdef',
+      error_summary: 'dbt test failed',
+      logs_url: '/api/v1/projects/test/airflow-proxy/dags/etl_main/logs',
+      artifacts: [{
+        name: 'manifest.json',
+        download_url: '/api/v1/projects/test/airflow/dags/etl_main/runs/run_with_provenance/artifacts/manifest.json',
+      }],
+    };
+    window.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/stats')) return Promise.resolve(Response.json(mockStats));
+      if (init?.method === 'POST' && url.endsWith('/runs')) return Promise.resolve(Response.json(detailedRun, { status: 201 }));
+      if (url.includes('/runs')) return Promise.resolve(Response.json([detailedRun]));
+      return Promise.resolve(Response.json(mockDags));
+    }) as typeof fetch;
+    render(
+      <MemoryRouter initialEntries={['/projects/test/pipeline']}>
+        <Routes><Route path="/projects/:slug/pipeline" element={<PipelinePage />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /etl_main/ }));
+    fireEvent.click(screen.getByText('Recent Runs'));
+    expect(await screen.findByText('dbt test failed')).toBeInTheDocument();
+    expect(screen.getByTitle('0123456789abcdef0123456789abcdef')).toHaveTextContent('0123456789ab');
+    expect(screen.getByRole('link', { name: 'Logs' })).toHaveAttribute('href', detailedRun.logs_url);
+
+    const createObjectURL = vi.fn(() => 'blob:manifest');
+    const revokeObjectURL = vi.fn();
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    Object.assign(URL, { createObjectURL, revokeObjectURL });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Download manifest.json' }));
+    await waitFor(() => expect(window.fetch).toHaveBeenCalledWith(
+      detailedRun.artifacts[0].download_url,
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer test-token' }),
+      }),
+    ));
+    expect(createObjectURL).toHaveBeenCalled();
+    expect(revokeObjectURL).toHaveBeenCalledWith('blob:manifest');
+    click.mockRestore();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Run now' }));
+    await waitFor(() => expect(window.fetch).toHaveBeenCalledWith(
+      '/api/v1/projects/test/airflow/dags/etl_main/runs',
+      expect.objectContaining({ method: 'POST' }),
+    ));
+  });
+
+  it('hides the trigger from viewers while retaining readable pipeline controls', async () => {
+    auth.user = {
+      is_admin: false,
+      projects: [{ slug: 'test', role: 'viewer' }],
+    };
+    render(
+      <MemoryRouter initialEntries={['/projects/test/pipeline']}>
+        <Routes><Route path="/projects/:slug/pipeline" element={<PipelinePage />} /></Routes>
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: /etl_main/ }));
+    expect(screen.queryByRole('button', { name: 'Run now' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Open in Airflow/ })).toBeInTheDocument();
   });
 });

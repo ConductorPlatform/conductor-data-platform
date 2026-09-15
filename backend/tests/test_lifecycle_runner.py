@@ -17,6 +17,8 @@ def _settings(*, warehouse_dsn: str | None) -> SimpleNamespace:
         database_url="postgresql+asyncpg://conductor@metadata:5432/conductor",
         lifecycle_warehouse_maintenance_dsn=warehouse_dsn,
         lifecycle_runtime_root="/tmp/conductor-runtimes",
+        lifecycle_runtime_secret_root="/tmp/conductor-runtime-secrets",
+        lifecycle_runtime_artifact_root="/tmp/conductor-runtime-artifacts",
         lifecycle_runtime_ingress_network="conductor-runtime-ingress",
         lifecycle_airflow_image="conductor-airflow:test",
         lifecycle_airflow_database_host="metadata",

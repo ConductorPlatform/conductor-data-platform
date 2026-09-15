@@ -4,10 +4,12 @@ import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from app.config import settings
+from app.models.user import User
 from app.services.project_airflow_context import ProjectAirflowContext
 
 
@@ -83,8 +85,8 @@ async def test_artifact_endpoint_authorizes_run_provenance_and_streams_indexed_b
     monkeypatch.setattr(widgets.AirflowSessionManager, "get_access_token", token)
     monkeypatch.setattr(widgets.httpx, "AsyncClient", Client)
 
-    response = await widgets.get_dbt_run_artifact(
-        "project", "dag", "run", "manifest.json", SimpleNamespace(id="user"), object()
+    response = await widgets.download_dag_run_artifact(
+        "project", "dag", "run", "manifest.json", cast(User, SimpleNamespace(id="user")), object()
     )
 
     assert response.status_code == 200

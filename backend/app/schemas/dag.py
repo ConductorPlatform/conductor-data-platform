@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class DAGSummary(BaseModel):
@@ -22,3 +23,12 @@ class DAGRunInfo(BaseModel):
     start_date: datetime | None
     end_date: datetime | None
     duration: float | None
+    commit_sha: str | None = None
+    error_summary: str | None = None
+    logs_url: str | None = None
+    artifacts: list["DAGRunArtifact"] = Field(default_factory=list)
+
+
+class DAGRunArtifact(BaseModel):
+    name: Literal["manifest.json", "run_results.json"]
+    download_url: str
